@@ -1,13 +1,13 @@
 if(NOT LIBSDRPLAY_FOUND)
   pkg_check_modules (LIBSDRPLAY_PKG libsdrplay)
-  find_path(LIBSDRPLAY_INCLUDE_DIRS NAMES mirsdrapi-rsp.h
+  find_path(LIBSDRPLAY_INCLUDE_DIRS NAMES sdrplay_api.h
     PATHS
     ${LIBSDRPLAY_PKG_INCLUDE_DIRS}
     /usr/include
     /usr/local/include
   )
 
-  find_library(LIBSDRPLAY_LIBRARIES NAMES mirsdrapi-rsp
+  find_library(LIBSDRPLAY_LIBRARIES NAMES sdrplay_api
     PATHS
     ${LIBSDRPLAY_PKG_LIBRARY_DIRS}
     /usr/lib

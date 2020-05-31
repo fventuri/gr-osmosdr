@@ -1,5 +1,6 @@
 /* -*- c++ -*- */
 /*
+ * Copyright 2020 Franco Venturi
  * Copyright 2015 SDRplay Ltd <support@sdrplay.com>
  * Copyright 2012 Dimitri Stolnikov <horiz0n@gmx.net>
  * Copyright 2012 Steve Markgraf <steve@steve-m.de>
@@ -40,8 +41,10 @@
 #include <iostream>
 #include <stdio.h>
 #include <math.h>
+#include <cstdarg>
+#include <sstream>
 
-#include <mirsdrapi-rsp.h>
+#include <sdrplay_api.h>
 
 #include "arg_helpers.h"
 
@@ -49,35 +52,89 @@
 
 struct sdrplay_dev
 {
-   int gRdB;
-   double gain_dB;
-   double fsHz;
+   // general parameters
    double rfHz;
-   mir_sdr_Bw_MHzT bwType;
-   mir_sdr_If_kHzT ifType;
-   int samplesPerPacket;
-   int maxGain;
-   int minGain;
+   std::string antenna;
+   sdrplay_api_Bw_MHzT bwType;
+   sdrplay_api_If_kHzT ifType;
+
+   // sample rate parameters
+   double sample_rate;   // final SR
+   double fsHz;          // HW SR
+   int decimation;
+
+   // gain parameters
+   int if_gRdB;
+   int min_if_gRdB;
+   int max_if_gRdB;
+   std::vector<int> rfGRs;
+   int rf_gR_index;
+
+   // other parameters
    int dcMode;
+   double ppm;
+
+   // hardware specific parameters
+   std::string sdrplay;
+   unsigned char hwVer;
+   sdrplay_api_RspDuoModeT rspDuoMode;
+   double rspDuoSampleFreq;
+   sdrplay_api_TunerSelectT tuner;
+   sdrplay_api_RspDuoModeCbEventIdT rspDuoModeChangeType;
+
+   sdrplay_api_DeviceT device;
+   sdrplay_api_DeviceParamsT *device_params;
+   sdrplay_api_RxChannelParamsT *rx_channel_params;
 };
 
 using namespace boost::assign;
 
-#define BYTES_PER_SAMPLE  4 // sdrplay device delivers 16 bit signed IQ data
-                            // containing 12 bits of information
+#define SDRPLAY_FREQ_MIN    1e3
+#define SDRPLAY_FREQ_MAX 2000e6
 
-#define SDRPLAY_AM_MIN     150e3
-#define SDRPLAY_AM_MAX      30e6
-#define SDRPLAY_FM_MIN      64e6
-#define SDRPLAY_FM_MAX     108e6
-#define SDRPLAY_B3_MIN     162e6
-#define SDRPLAY_B3_MAX     240e6
-#define SDRPLAY_B45_MIN    470e6
-#define SDRPLAY_B45_MAX    960e6
-#define SDRPLAY_L_MIN     1450e6
-#define SDRPLAY_L_MAX     1675e6
+#define SDRPLAY_MAX_BUF_SIZE 2016
 
-#define SDRPLAY_MAX_BUF_SIZE 504
+// Singleton class for SDRplay API (only one per process)
+class sdrplay_api {
+public:
+   static sdrplay_api& get_instance()
+   {
+      static sdrplay_api instance;
+      return instance;
+   }
+
+private:
+   sdrplay_api();
+
+public:
+   ~sdrplay_api();
+   sdrplay_api(sdrplay_api const&)    = delete;
+   void operator=(sdrplay_api const&) = delete;
+};
+
+
+// forward declaration of streaming functions
+static void stream_A_callback(short *xi, short *xq,
+                              sdrplay_api_StreamCbParamsT *params,
+                              unsigned int numSamples,
+                              unsigned int reset,
+                              void *cbContext);
+static void stream_B_callback(short *xi, short *xq,
+                              sdrplay_api_StreamCbParamsT *params,
+                              unsigned int numSamples,
+                              unsigned int reset,
+                              void *cbContext);
+static void event_callback(sdrplay_api_EventT eventId,
+                           sdrplay_api_TunerSelectT tuner,
+                           sdrplay_api_EventParamsT *params,
+                           void *cbContext);
+
+// forward declaration of utility functions
+static void fatal(const char *message, sdrplay_api_ErrT err);
+static void fatal(const char *format, ...);
+static std::string hwName(unsigned char hwVer);
+static std::string rspDuoModeName(sdrplay_api_RspDuoModeT rspDuoMode);
+
 
 /*
  * Create a new instance of sdrplay_source_c and return
@@ -98,6 +155,7 @@ make_sdrplay_source_c (const std::string &args)
  * are connected to this block.  In this case, we accept
  * only 0 input and 1 output.
  */
+/* no dual tuner for now */
 static const int MIN_IN = 0;	// mininum number of input streams
 static const int MAX_IN = 0;	// maximum number of input streams
 static const int MIN_OUT = 1;	// minimum number of output streams
@@ -110,30 +168,73 @@ sdrplay_source_c::sdrplay_source_c (const std::string &args)
   : gr::sync_block ("sdrplay_source_c",
         gr::io_signature::make(MIN_IN, MAX_IN, sizeof (gr_complex)),
         gr::io_signature::make(MIN_OUT, MAX_OUT, sizeof (gr_complex))),
+    _selected(false),
+    _started(false),
     _running(false),
-    _uninit(false),
-    _auto_gain(false)
+    _auto_gain(false),
+    _next_sample_num(0)
 {
-   _dev = (sdrplay_dev_t *)malloc(sizeof(sdrplay_dev_t));
+   _dev = new sdrplay_dev_t();
    if (_dev == NULL)
    {
       return;
-}
-   _dev->fsHz = 2048e3;
-   _dev->rfHz = 200e6;
-   _dev->bwType = mir_sdr_BW_1_536;
-   _dev->ifType = mir_sdr_IF_Zero;
-   _dev->samplesPerPacket = 0;
+   }
+   _dev->rfHz = 14236000;
+   _dev->bwType = sdrplay_api_BW_0_200;
+   _dev->ifType = sdrplay_api_IF_1_620;
+   _dev->sample_rate = 62.5e3;
+   _dev->fsHz = 62.5e3;
+   _dev->decimation = 1;
+   _dev->if_gRdB = 50;
+   _dev->min_if_gRdB = sdrplay_api_NORMAL_MIN_GR;
+   _dev->max_if_gRdB = MAX_BB_GR;
    _dev->dcMode = 0;
-   _dev->gRdB = 60;
-   set_gain_limits(_dev->rfHz);
-   _dev->gain_dB = _dev->maxGain - _dev->gRdB;
-   
-   _bufi.reserve(SDRPLAY_MAX_BUF_SIZE);
-   _bufq.reserve(SDRPLAY_MAX_BUF_SIZE);   
+   dict_t dict = params_to_dict(args);
+   _dev->sdrplay = dict.count("sdrplay") ? dict["sdrplay"] : "0";
+   _dev->hwVer = dict.count("hwVer") ?
+                 static_cast<unsigned char>(std::stoul(dict["hwVer"])) : 0;
+   _dev->rspDuoMode = dict.count("rspDuoMode") ?
+                      static_cast<sdrplay_api_RspDuoModeT>(std::stoi(dict["rspDuoMode"])) :
+                      sdrplay_api_RspDuoMode_Unknown;
+   switch (_dev->rspDuoMode)
+   {
+   case sdrplay_api_RspDuoMode_Single_Tuner:
+      _dev->rspDuoSampleFreq = 0;
+      break;
+   case sdrplay_api_RspDuoMode_Dual_Tuner:
+   case sdrplay_api_RspDuoMode_Master:
+   case sdrplay_api_RspDuoMode_Slave:
+      _dev->rspDuoSampleFreq = dict.count("rspDuoSampleFreq") ?
+                               std::stod(dict["rspDuoSampleFreq"]) : 6e6;
+      break;
+   case sdrplay_api_RspDuoMode_Unknown:
+      _dev->rspDuoSampleFreq = 0;
+      break;
+   }
+   switch (_dev->rspDuoMode)
+   {
+   case sdrplay_api_RspDuoMode_Master:
+      _dev->rspDuoModeChangeType = sdrplay_api_SlaveDllDisappeared;
+      break;
+   default:
+      _dev->rspDuoModeChangeType = sdrplay_api_SlaveAttached;
+      break;
+   }
+   _dev->tuner = dict.count("tuner") ?
+                 static_cast<sdrplay_api_TunerSelectT>(std::stoi(dict["tuner"])) :
+                 sdrplay_api_Tuner_Neither;
+   _dev->antenna = get_antennas(0).at(0);
+   // RF gain values depend on RSP model (hwVer), RF frequency, and antenna type
+   set_rf_gain_values();
+   _dev->rf_gR_index = (_dev->hwVer == SDRPLAY_RSP2_ID ||
+                        _dev->hwVer == SDRPLAY_RSPduo_ID ||
+                        _dev->hwVer == SDRPLAY_RSP1A_ID ||
+                        _dev->hwVer == SDRPLAY_RSPdx_ID) ? 4 : 1;
 
    _buf_mutex.lock();
-   _buf_offset = 0;
+   _bufi = 0;
+   _bufq = 0;
+   _buf_length = 0;
    _buf_mutex.unlock();
 }
 
@@ -142,69 +243,362 @@ sdrplay_source_c::sdrplay_source_c (const std::string &args)
  */
 sdrplay_source_c::~sdrplay_source_c ()
 {
+   stop();
    free(_dev);
    _dev = NULL;
-   _buf_mutex.lock();
-   if (_running)
-   {
-      _running = false;
-   }
-   _uninit = true;
-   _buf_mutex.unlock();
 }
 
-void sdrplay_source_c::reinit_device()
+void sdrplay_source_c::set_rf_gain_values()
 {
-   std::cerr << "reinit_device started" << std::endl;
-   _buf_mutex.lock();
-   std::cerr << "after mutex.lock" << std::endl;
-   if (_running)
+   if (_dev->hwVer == SDRPLAY_RSP1_ID)
    {
-      std::cerr << "mir_sdr_Uninit started" << std::endl;
-      mir_sdr_Uninit();
+      if (_dev->rfHz <= 420e6)
+      {
+          _dev->rfGRs = std::vector<int> { 0, 24, 19, 43 };
+      }
+      else if (_dev->rfHz <= 1000e6)
+      {
+          _dev->rfGRs = std::vector<int> { 0, 7, 19, 26 };
+      }
+      else if (_dev->rfHz <= 2000e6)
+      {
+          _dev->rfGRs = std::vector<int> { 0, 5, 19, 24 };
+      }
    }
-
-   std::cerr << "mir_sdr_Init started" << std::endl;
-   mir_sdr_Init(_dev->gRdB, _dev->fsHz / 1e6, _dev->rfHz / 1e6, _dev->bwType, _dev->ifType, &_dev->samplesPerPacket);
-
-   if (_dev->dcMode)
+   else if (_dev->hwVer == SDRPLAY_RSP1A_ID)
    {
-      std::cerr << "mir_sdr_SetDcMode started" << std::endl;
-      mir_sdr_SetDcMode(4, 1);
+      if (_dev->rfHz <= 60e6)
+      {
+          _dev->rfGRs = std::vector<int> { 0, 6, 12, 18, 37, 42, 61 };
+      }
+      else if (_dev->rfHz <= 420e6)
+      {
+          _dev->rfGRs = std::vector<int> { 0, 6, 12, 18, 20, 26, 32, 38, 57, 62 };
+      }
+      else if (_dev->rfHz <= 1000e6)
+      {
+          _dev->rfGRs = std::vector<int> { 0, 7, 13, 19, 20, 27, 33, 39, 45, 64 };
+      }
+      else if (_dev->rfHz <= 2000e6)
+      {
+          _dev->rfGRs = std::vector<int> { 0, 6, 12, 20, 26, 32, 38, 43, 62 };
+      }
    }
-
-   _buf_offset = 0;
-   _buf_mutex.unlock();
-   std::cerr << "reinit_device end" << std::endl;
+   else if (_dev->hwVer == SDRPLAY_RSP2_ID)
+   {
+      if (_dev->rfHz <= 60e6 && _dev->antenna == "Hi-Z")
+      {
+          _dev->rfGRs = std::vector<int> { 0, 6, 12, 18, 37 };
+      }
+      else if (_dev->rfHz <= 420e6)
+      {
+          _dev->rfGRs = std::vector<int> { 0, 10, 15, 21, 24, 34, 39, 45, 64 };
+      }
+      else if (_dev->rfHz <= 1000e6)
+      {
+          _dev->rfGRs = std::vector<int> { 0, 7, 10, 17, 22, 41 };
+      }
+      else if (_dev->rfHz <= 2000e6)
+      {
+          _dev->rfGRs = std::vector<int> { 0, 5, 21, 15, 15, 34 };
+      }
+   }
+   else if (_dev->hwVer == SDRPLAY_RSPduo_ID)
+   {
+      if (_dev->rfHz <= 60e6 && _dev->antenna != "Tuner 1 Hi-Z")
+      {
+          _dev->rfGRs = std::vector<int> { 0, 6, 12, 18, 37, 42, 61 };
+      }
+      else if (_dev->rfHz <= 60e6 && _dev->antenna == "Tuner 1 Hi-Z")
+      {
+          _dev->rfGRs = std::vector<int> { 0, 6, 12, 18, 37 };
+      }
+      else if (_dev->rfHz <= 420e6)
+      {
+          _dev->rfGRs = std::vector<int> { 0, 6, 12, 18, 20, 26, 32, 38, 57, 62 };
+      }
+      else if (_dev->rfHz <= 1000e6)
+      {
+          _dev->rfGRs = std::vector<int> { 0, 7, 13, 19, 20, 27, 33, 39, 45, 64 };
+      }
+      else if (_dev->rfHz <= 2000e6)
+      {
+          _dev->rfGRs = std::vector<int> { 0, 6, 12, 20, 26, 32, 38, 43, 62 };
+      }
+   }
+   else if (_dev->hwVer == SDRPLAY_RSPdx_ID)
+   {
+      if (_dev->rfHz <= 2e6)  // HDR mode
+      {
+          _dev->rfGRs = std::vector<int> { 0, 3, 6, 9, 12, 15, 18, 21, 24, 25, 27, 30, 33, 36, 39, 42, 45, 48, 51, 54, 57, 60 };
+      }
+      else if (_dev->rfHz <= 12e6)
+      {
+          _dev->rfGRs = std::vector<int> { 0, 3, 6, 9, 12, 15, 24, 27, 30, 33, 36, 39, 42, 45, 48, 51, 54, 57, 60 };
+      }
+      else if (_dev->rfHz <= 60e6)
+      {
+          _dev->rfGRs = std::vector<int> { 0, 3, 6, 9, 12, 15, 18, 24, 27, 30, 33, 36, 39, 42, 45, 48, 51, 54, 57, 60 };
+      }
+      else if (_dev->rfHz <= 250e6)
+      {
+          _dev->rfGRs = std::vector<int> { 0, 3, 6, 9, 12, 15, 24, 27, 30, 33, 36, 39, 42, 45, 48, 51, 54, 57, 60, 63, 66, 69, 72, 75, 78, 81, 84 };
+      }
+      else if (_dev->rfHz <= 420e6)
+      {
+          _dev->rfGRs = std::vector<int> { 0, 3, 6, 9, 12, 15, 18, 24, 27, 30, 33, 36, 39, 42, 45, 48, 51, 54, 57, 60, 63, 66, 69, 72, 75, 78, 81, 84 };
+      }
+      else if (_dev->rfHz <= 1000e6)
+      {
+          _dev->rfGRs = std::vector<int> { 0, 7, 10, 13, 16, 19, 22, 25, 31, 34, 37, 40, 43, 46, 49, 52, 55, 58, 61, 64, 67 };
+      }
+      else if (_dev->rfHz <= 2000e6)
+      {
+          _dev->rfGRs = std::vector<int> { 0, 5, 8, 11, 14, 17, 20, 32, 35, 38, 41, 44, 47, 50, 53, 56, 59, 62, 65 };
+      }
+   }
+   return;
 }
 
-void sdrplay_source_c::set_gain_limits(double freq)
+bool sdrplay_source_c::select_rspduo_device()
 {
-   if (freq <= SDRPLAY_AM_MAX)
-   {
-      _dev->minGain = -4;
-      _dev->maxGain = 98;
+   if ((_dev->rspDuoMode & _dev->device.rspDuoMode) != _dev->rspDuoMode) {
+      std::cerr << "[ERROR] invalid RSPduo mode " << _dev->rspDuoMode << std::endl;
+      return false;
    }
-   else if (freq <= SDRPLAY_FM_MAX)
-   {
-      _dev->minGain = 1;
-      _dev->maxGain = 103;
+   _dev->device.rspDuoMode = _dev->rspDuoMode;
+   if ((_dev->tuner & _dev->device.tuner) != _dev->tuner) {
+      std::cerr << "[ERROR] invalid RSPduo tuner " << _dev->tuner << std::endl;
+      return false;
    }
-   else if (freq <= SDRPLAY_B3_MAX)
+   _dev->device.tuner = _dev->tuner;
+   switch (_dev->rspDuoMode)
    {
-      _dev->minGain = 5;
-      _dev->maxGain = 107;
+   case sdrplay_api_RspDuoMode_Single_Tuner:
+      break;
+   case sdrplay_api_RspDuoMode_Dual_Tuner:
+   case sdrplay_api_RspDuoMode_Master:
+      if (!(_dev->rspDuoSampleFreq == 6e6 || _dev->rspDuoSampleFreq == 8e6)) {
+         std::cerr << "[ERROR] invalid RSPduo sample freq " << _dev->rspDuoSampleFreq << "Hz" << std::endl;
+         return false;
+      }
+      _dev->device.rspDuoSampleFreq = _dev->rspDuoSampleFreq;
+      break;
+   case sdrplay_api_RspDuoMode_Slave:
+      if (_dev->rspDuoSampleFreq != _dev->device.rspDuoSampleFreq) {
+         std::cerr << "[ERROR] invalid RSPduo sample freq " << _dev->rspDuoSampleFreq << std::endl;
+         return false;
+      }
+      break;
+   case sdrplay_api_RspDuoMode_Unknown:
+      break;
    }
-   else if (freq <= SDRPLAY_B45_MAX)
+   return true;
+}
+
+bool sdrplay_source_c::select_device()
+{
+   bool status = true;
+   sdrplay_api_ErrT err = sdrplay_api_LockDeviceApi();
+   if (err != sdrplay_api_Success) {
+      fatal("sdrplay_api_LockDeviceApi() Error: ", err);
+   }
+   unsigned int dev_cnt = MAX_SUPPORTED_DEVICES;
+   sdrplay_api_DeviceT devs[MAX_SUPPORTED_DEVICES];
+   err = sdrplay_api_GetDevices(devs, &dev_cnt, dev_cnt);
+   if (err != sdrplay_api_Success) {
+      fatal("sdrplay_api_GetDevices() Error: ", err);
+   }
+   // device index or serial number?
+   bool device_found = false;
+   if (_dev->sdrplay.length() <= 2) {
+      unsigned int device_index = std::stoi(_dev->sdrplay);
+      if (device_index < dev_cnt) {
+         _dev->device = devs[device_index];
+         device_found = true;
+      }
+   } else {
+      // look for the serial number
+      for (unsigned int device_index = 0; device_index < dev_cnt; ++device_index) {
+         if (_dev->sdrplay == devs[device_index].SerNo) {
+            _dev->device = devs[device_index];
+            device_found = true;
+            break;
+         }
+      }
+   }
+   if (!device_found) {
+      fatal("sdrplay device not found: %s", _dev->sdrplay.c_str());
+   }
+   _dev->hwVer = _dev->device.hwVer;
+   if (_dev->hwVer == SDRPLAY_RSPduo_ID)
    {
-      _dev->minGain = 9;
-      _dev->maxGain = 94;
+      status = select_rspduo_device();
    }
-   else if (freq <= SDRPLAY_L_MAX)
+   if (status) {
+      err = sdrplay_api_SelectDevice(&_dev->device);
+      if (err != sdrplay_api_Success) {
+         fatal("sdrplay_api_SelectDevice() Error: ", err);
+      }
+      _selected = true;
+   }
+   err = sdrplay_api_UnlockDeviceApi();
+   if (err != sdrplay_api_Success) {
+      fatal("sdrplay_api_UnlockDeviceApi() Error: ", err);
+   }
+   return status;
+}
+
+void sdrplay_source_c::set_device_antenna()
+{
+   if (_dev->hwVer == SDRPLAY_RSP2_ID)
    {
-      _dev->minGain = 24;
-      _dev->maxGain = 105;
+      sdrplay_api_Rsp2TunerParamsT *rsp2TunerParams = &_dev->rx_channel_params->rsp2TunerParams;
+      if (_dev->antenna == "Antenna A") {
+         rsp2TunerParams->antennaSel = sdrplay_api_Rsp2_ANTENNA_A;
+         rsp2TunerParams->amPortSel = sdrplay_api_Rsp2_AMPORT_2;
+      } else if (_dev->antenna == "Antenna B") {
+         rsp2TunerParams->antennaSel = sdrplay_api_Rsp2_ANTENNA_B;
+         rsp2TunerParams->amPortSel = sdrplay_api_Rsp2_AMPORT_2;
+      } else if (_dev->antenna == "Hi-Z") {
+         rsp2TunerParams->antennaSel = sdrplay_api_Rsp2_ANTENNA_A;
+         rsp2TunerParams->amPortSel = sdrplay_api_Rsp2_AMPORT_1;
+      }
    }
+   else if (_dev->hwVer == SDRPLAY_RSPduo_ID)
+   {
+      sdrplay_api_RspDuoTunerParamsT *rspDuoTunerParams = &_dev->rx_channel_params->rspDuoTunerParams;
+      if (_dev->antenna == "Tuner 1 Hi-Z") {
+         rspDuoTunerParams->tuner1AmPortSel = sdrplay_api_RspDuo_AMPORT_1;
+      } else {
+         rspDuoTunerParams->tuner1AmPortSel = sdrplay_api_RspDuo_AMPORT_2;
+      }
+   }
+   else if (_dev->hwVer == SDRPLAY_RSPdx_ID)
+   {
+      sdrplay_api_RspDxParamsT *rspDxParams = &_dev->device_params->devParams->rspDxParams;
+      if (_dev->antenna == "Antenna A") {
+         rspDxParams->antennaSel = sdrplay_api_RspDx_ANTENNA_A;
+      } else if (_dev->antenna == "Antenna B") {
+         rspDxParams->antennaSel = sdrplay_api_RspDx_ANTENNA_B;
+      } else if (_dev->antenna == "Antenna C") {
+         rspDxParams->antennaSel = sdrplay_api_RspDx_ANTENNA_C;
+      }
+   }
+}
+
+bool sdrplay_source_c::start()
+{
+   if (!select_device())
+      return false;
+
+   sdrplay_api_ErrT err = sdrplay_api_GetDeviceParams(_dev->device.dev, &_dev->device_params);
+   if (err != sdrplay_api_Success) {
+      fatal("sdrplay_api_GetDeviceParams() Error: ", err);
+   }
+   _dev->rx_channel_params = _dev->device_params->rxChannelA;
+   if (_dev->tuner == sdrplay_api_Tuner_B)
+      _dev->rx_channel_params = _dev->device_params->rxChannelB;
+
+   sdrplay_api_TunerParamsT *tunerParams = &_dev->rx_channel_params->tunerParams;
+
+   // general parameters
+   tunerParams->rfFreq.rfHz = _dev->rfHz;
+   set_device_antenna();
+   set_rf_gain_values();
+   tunerParams->bwType = _dev->bwType;
+   tunerParams->ifType = _dev->ifType;
+
+   // sample rate parameters
+   if (_dev->device_params->devParams) {
+      _dev->device_params->devParams->fsFreq.fsHz = _dev->fsHz;
+   }
+   sdrplay_api_DecimationT *decimation = &_dev->rx_channel_params->ctrlParams.decimation;
+   decimation->decimationFactor = _dev->decimation;
+   decimation->enable = _dev->decimation > 1;
+
+   // gain parameters
+   _dev->rf_gR_index = std::min(_dev->rf_gR_index,
+                                static_cast<int>(_dev->rfGRs.size() - 1));
+   tunerParams->gain.LNAstate = _dev->rf_gR_index;
+   sdrplay_api_AgcT *agc = &_dev->rx_channel_params->ctrlParams.agc;
+   if (_auto_gain)
+   {
+      agc->enable = sdrplay_api_AGC_CTRL_EN;
+      agc->setPoint_dBfs = -30;
+      agc->attack_ms = 0;
+      agc->decay_ms = 0;
+      agc->decay_delay_ms = 0;
+      agc->decay_threshold_dB = 0;
+      agc->syncUpdate = 0;
+   } else {
+      agc->enable = sdrplay_api_AGC_DISABLE;
+      tunerParams->gain.gRdB = _dev->if_gRdB;
+   }
+
+   // other parameters
+   _dev->rx_channel_params->ctrlParams.dcOffset.DCenable = _dev->dcMode;
+   tunerParams->dcOffsetTuner.dcCal = 4;
+   tunerParams->dcOffsetTuner.speedUp = 0;
+   tunerParams->dcOffsetTuner.trackTime = 63;
+   if (_dev->device_params->devParams) {
+      _dev->device_params->devParams->ppm = _dev->ppm;
+   }
+
+   // prepare callback functions for streaming
+   sdrplay_api_CallbackFnsT cbFns;
+   cbFns.StreamACbFn = stream_A_callback;
+   cbFns.StreamBCbFn = stream_B_callback;
+   cbFns.EventCbFn = event_callback;
+
+   // buffers
+   _buf_mutex.lock();
+   _bufi = 0;
+   _bufq = 0;
+   _buf_length = 0;
+   _buf_mutex.unlock();
+
+   _next_sample_num = 0;
+
+   // start streaming (finally!)
+   err = sdrplay_api_Init(_dev->device.dev, &cbFns, this);
+   if (err != sdrplay_api_Success) {
+      fatal("sdrplay_api_Init() Error: ", err);
+   }
+   _started = true;
+
+   return true;
+}
+
+bool sdrplay_source_c::stop()
+{
+   sdrplay_api_ErrT err;
+   _running = false;
+   if (_started)
+   {
+      err = sdrplay_api_Uninit(_dev->device.dev);
+      if (err != sdrplay_api_Success) {
+         fatal("sdrplay_api_Uninit() Error: ", err);
+      }
+      _started = false;
+   }
+   if (_selected)
+   {
+      err = sdrplay_api_LockDeviceApi();
+      if (err != sdrplay_api_Success) {
+         fatal("sdrplay_api_LockDeviceApi() Error: ", err);
+      }
+      err = sdrplay_api_ReleaseDevice(&_dev->device);
+      if (err != sdrplay_api_Success) {
+         fatal("sdrplay_api_ReleaseDevice() Error: ", err);
+      }
+      err = sdrplay_api_UnlockDeviceApi();
+      if (err != sdrplay_api_Success) {
+         fatal("sdrplay_api_UnlockDeviceApi() Error: ", err);
+      }
+      _selected = false;
+   }
+   return true;
 }
 
 int sdrplay_source_c::work( int noutput_items,
@@ -212,89 +606,133 @@ int sdrplay_source_c::work( int noutput_items,
                             gr_vector_void_star &output_items )
 {
    gr_complex *out = (gr_complex *)output_items[0];
-   int cnt = noutput_items;
-   unsigned int sampNum;
-   int grChanged;
-   int rfChanged;
-   int fsChanged;
-
-   if (_uninit)
-   {
-      return WORK_DONE;
-   }
-
-   if (!_running)
-   {
-      reinit_device();
-      _running = true;
-   }
-
-   _buf_mutex.lock();
-
-   if (_buf_offset)
-   {
-      for (int i = _buf_offset; i < _dev->samplesPerPacket; i++)
-      {
-         *out++ = gr_complex( float(_bufi[i]) * (1.0f/2048.0f), float(_bufq[i]) * (1.0f/2048.0f) );
-      }
-      cnt -= (_dev->samplesPerPacket - _buf_offset);
-   }
-
-   while ((cnt - _dev->samplesPerPacket) >= 0)
-   {
-      mir_sdr_ReadPacket(_bufi.data(), _bufq.data(), &sampNum, &grChanged, &rfChanged, &fsChanged);
-      for (int i = 0; i < _dev->samplesPerPacket; i++)
-      {
-         *out++ = gr_complex( float(_bufi[i]) * (1.0f/2048.0f), float(_bufq[i]) * (1.0f/2048.0f) );
-      }
-      cnt -= _dev->samplesPerPacket;
-   }
-
-   _buf_offset = 0;
-   if (cnt)
-   {
-      mir_sdr_ReadPacket(_bufi.data(), _bufq.data(), &sampNum, &grChanged, &rfChanged, &fsChanged);
-      for (int i = 0; i < cnt; i++)
-      {
-         *out++ = gr_complex( float(_bufi[i]) * (1.0f/2048.0f), float(_bufq[i]) * (1.0f/2048.0f) );
-      }
-      _buf_offset = cnt;
-   }
-   _buf_mutex.unlock();
-
+   _running = true;
+#ifdef ONLY_CHECK_SAMPLE_GAPS
    return noutput_items;
+#endif
+   if (_buf_length < 0)
+   {
+      _buf_length = -_buf_length;
+   }
+   else
+   {
+      std::unique_lock<std::mutex> lock(_buf_mutex);
+      _buf_ready.wait(lock, [this]{return _buf_length > 0;});
+   }
+   // try to minimize latency by returning samples as soon as we have them
+   // (as opposed to try to fill the out buffer as much as we can, in order
+   // to maximize bandwidth)
+   noutput_items = std::min(noutput_items, _buf_length);
+   for (int i = 0; i < noutput_items; ++i)
+   {
+      *out++ = gr_complex( float(_bufi[i]) / 32768.0f,
+                           float(_bufq[i]) / 32768.0f );
+   }
+   _buf_length = noutput_items - _buf_length;
+   if (_buf_length < 0)
+   {
+      _bufi += noutput_items;
+      _bufq += noutput_items;
+   }
+   else
+   {
+      _buf_mutex.unlock();
+      _buf_ready.notify_one();
+   }
+   return noutput_items;
+}
+
+std::vector<std::string> get_rspduo_pseudo_devices(unsigned int dev_idx,
+                                                const sdrplay_api_DeviceT *dev)
+{
+   std::vector<std::string> devices;
+
+   struct {
+      sdrplay_api_RspDuoModeT rspDuoMode; double rspDuoSampleFreq;
+   } modes[] = {
+      { sdrplay_api_RspDuoMode_Single_Tuner, 0 },
+      { sdrplay_api_RspDuoMode_Dual_Tuner, 6000000 },
+      { sdrplay_api_RspDuoMode_Master, 6000000 },
+      { sdrplay_api_RspDuoMode_Master, 8000000 },
+      { sdrplay_api_RspDuoMode_Slave, 0 }
+   };
+
+   for (auto mode : modes)
+   {
+      if (mode.rspDuoMode & dev->rspDuoMode)
+      {
+         // don't present slave mode if master is available
+         if (mode.rspDuoMode == sdrplay_api_RspDuoMode_Slave &&
+             (dev->rspDuoMode & sdrplay_api_RspDuoMode_Master))
+         {
+            continue;
+         }
+         std::stringstream args;
+         args << "sdrplay=" << dev_idx << ",hwVer=" << int(dev->hwVer);
+         args << ",rspDuoMode=" << mode.rspDuoMode;
+         if (mode.rspDuoSampleFreq != 0 && mode.rspDuoSampleFreq != 6000000)
+         {
+            args << ",rspDuoSampleFreq=" << mode.rspDuoSampleFreq;
+         }
+         args << ",tuner=" << dev->tuner;
+         args << ",label='SDRplay " << hwName(dev->hwVer) << " " << dev->SerNo << " " << rspDuoModeName(mode.rspDuoMode);
+         if (mode.rspDuoSampleFreq != 0 && mode.rspDuoSampleFreq != 6000000)
+         {
+            args << " SR=" << (mode.rspDuoSampleFreq / 1.0e6) << "MHz";
+         }
+         args << "'";
+         std::cerr << args.str() << std::endl;
+         devices.push_back( args.str() );
+      }
+   }
+   return devices;
 }
 
 std::vector<std::string> sdrplay_source_c::get_devices()
 {
    std::vector<std::string> devices;
-   std::cerr << "get_devices started" << std::endl;
 
-   unsigned int dev_cnt = 0;
-   int samplesPerPacket;
-   while(mir_sdr_Init(60, 2.048, 200.0, mir_sdr_BW_1_536, mir_sdr_IF_Zero, &samplesPerPacket) == mir_sdr_Success)
-   {
-      dev_cnt++;
+   sdrplay_api::get_instance();
+   sdrplay_api_ErrT err = sdrplay_api_LockDeviceApi();
+   if (err != sdrplay_api_Success) {
+      fatal("sdrplay_api_LockDeviceApi() Error: ", err);
+   }
+   unsigned int dev_cnt = MAX_SUPPORTED_DEVICES;
+   sdrplay_api_DeviceT devs[MAX_SUPPORTED_DEVICES];
+   err = sdrplay_api_GetDevices(devs, &dev_cnt, dev_cnt);
+   if (err != sdrplay_api_Success) {
+      fatal("sdrplay_api_GetDevices() Error: ", err);
+   }
+   err = sdrplay_api_UnlockDeviceApi();
+   if (err != sdrplay_api_Success) {
+      fatal("sdrplay_api_UnlockDeviceApi() Error: ", err);
    }
 
-   std::cerr << "Device count: " << dev_cnt << std::endl;
+   std::cerr << "Physical device count: " << dev_cnt << std::endl;
 
-   for (unsigned int i = 0; i < dev_cnt; i++) 
+   for (unsigned int i = 0; i < dev_cnt; ++i)
    {
-      mir_sdr_Uninit();
-      std::string args = "sdrplay=" + boost::lexical_cast< std::string >( i );
-      args += ",label='" + std::string("SDRplay RSP") + "'";
-      std::cerr << args << std::endl;
-      devices.push_back( args );
+      sdrplay_api_DeviceT *dev = &devs[i];
+      if (dev->hwVer == SDRPLAY_RSPduo_ID)
+      {
+          std::vector<std::string> rspduo_pseudo_devices = get_rspduo_pseudo_devices(i, dev);
+          devices.insert(devices.end(), rspduo_pseudo_devices.begin(),
+                         rspduo_pseudo_devices.end());
+      }
+      else
+      {
+         std::stringstream args;
+         args << "sdrplay=" << i << ",hwVer=" << int(dev->hwVer) << ",label='SDRplay " << hwName(dev->hwVer) << " " << dev->SerNo << "'";
+         std::cerr << args.str() << std::endl;
+         devices.push_back( args.str() );
+      }
    }
 
-   std::cerr << "get_devices end" << std::endl;
    return devices;
 }
 
 size_t sdrplay_source_c::get_num_channels()
 {
-   std::cerr << "get_num_channels: 1" << std::endl;
    return 1;
 }
 
@@ -302,146 +740,261 @@ osmosdr::meta_range_t sdrplay_source_c::get_sample_rates()
 {
    osmosdr::meta_range_t range;
 
-   range += osmosdr::range_t( 2000e3, 12000e3 ); 
+   range += osmosdr::range_t(   62.5e3 );
+   range += osmosdr::range_t(  125e3 );
+   range += osmosdr::range_t(  250e3 );
+   range += osmosdr::range_t(  500e3 );
+   range += osmosdr::range_t( 1000e3 );
+   range += osmosdr::range_t( 2000e3 );
+
+   if (_dev->hwVer != SDRPLAY_RSPduo_ID || _dev->rspDuoMode == sdrplay_api_RspDuoMode_Single_Tuner)
+   {
+      range += osmosdr::range_t(  2048e3 );
+      range += osmosdr::range_t(  3000e3 );
+      range += osmosdr::range_t(  4000e3 );
+      range += osmosdr::range_t(  5000e3 );
+      range += osmosdr::range_t(  6000e3 );
+      range += osmosdr::range_t(  7000e3 );
+      range += osmosdr::range_t(  8000e3 );
+      range += osmosdr::range_t(  9000e3 );
+      range += osmosdr::range_t( 10000e3 );
+   }
 
    return range;
 }
 
 double sdrplay_source_c::set_sample_rate(double rate)
 {
-   std::cerr << "set_sample_rate start" << std::endl;
-   double diff = rate - _dev->fsHz;
-   _dev->fsHz = rate;
+   double current_fsHz = _dev->fsHz;
+   int current_decimation = _dev->decimation;
+   sdrplay_api_Bw_MHzT current_bwType = _dev->bwType;
+   sdrplay_api_If_kHzT current_ifType = _dev->ifType;
 
-   std::cerr << "rate = " << rate << std::endl;
-   std::cerr << "diff = " << diff << std::endl;
-   if (_running) 
+   if (rate <= 2e6)
    {
-      if (fabs(diff) < 10000.0)
+      int decimation = int(2e6 / rate);
+      switch (decimation)
       {
-         std::cerr << "mir_sdr_SetFs started" << std::endl;
-         mir_sdr_SetFs(diff, 0, 0, 0);
+          case 1: break;
+          case 2: break;
+          case 4: break;
+          case 8: break;
+          case 16: break;
+          case 32: break;
+          default:
+             std::cerr << "[WARNING] invalid sample rate " << rate << "Hz" << std::endl;
+             return _dev->sample_rate;
+      }
+      _dev->sample_rate = 2e6 / decimation;
+      _dev->decimation = decimation;
+      if (_dev->hwVer != SDRPLAY_RSPduo_ID || _dev->rspDuoSampleFreq == 8e6)
+      {
+         _dev->fsHz = 8e6;
+         _dev->ifType = sdrplay_api_IF_2_048;
       }
       else
       {
-         std::cerr << "reinit_device started" << std::endl;
-         reinit_device();
+         _dev->fsHz = 6e6;
+         _dev->ifType = sdrplay_api_IF_1_620;
       }
    }
-   std::cerr << "set_sample_rate end" << std::endl;
+   else
+   {
+      _dev->sample_rate = rate;
+      _dev->decimation = 1;
+      _dev->fsHz = rate;
+      _dev->ifType = sdrplay_api_IF_Zero;
+   }
+   set_bandwidth( _dev->sample_rate, 0 );
 
-   return get_sample_rate();
+   if (_started)
+   {
+      sdrplay_api_ReasonForUpdateT reason = sdrplay_api_Update_None;
+      if (_dev->fsHz != current_fsHz)
+      {
+         if (_dev->device_params->devParams)
+         {
+            _dev->device_params->devParams->fsFreq.fsHz = _dev->fsHz;
+            reason = (sdrplay_api_ReasonForUpdateT)(reason |
+                                                    sdrplay_api_Update_Dev_Fs);
+         }
+         else
+         {
+            _dev->fsHz = current_fsHz;
+         }
+      }
+      if (_dev->decimation != current_decimation)
+      {
+         sdrplay_api_DecimationT *decimation = &_dev->rx_channel_params->ctrlParams.decimation;
+         decimation->decimationFactor = _dev->decimation;
+         decimation->enable = _dev->decimation > 1;
+         reason = (sdrplay_api_ReasonForUpdateT)(reason |
+                                                 sdrplay_api_Update_Ctrl_Decimation);
+      }
+      sdrplay_api_TunerParamsT *tunerParams = &_dev->rx_channel_params->tunerParams;
+      if (_dev->bwType != current_bwType)
+      {
+         tunerParams->bwType = _dev->bwType;
+         reason = (sdrplay_api_ReasonForUpdateT)(reason |
+                                                 sdrplay_api_Update_Tuner_BwType);
+      }
+      if (_dev->ifType != current_ifType)
+      {
+         tunerParams->ifType = _dev->ifType;
+         reason = (sdrplay_api_ReasonForUpdateT)(reason |
+                                                 sdrplay_api_Update_Tuner_IfType);
+      }
+
+      if (reason != sdrplay_api_Update_None)
+      {
+         sdrplay_api_ErrT err;
+         err = sdrplay_api_Update(_dev->device.dev, _dev->device.tuner, reason,
+                                  sdrplay_api_Update_Ext1_None);
+         if (err != sdrplay_api_Success) {
+            fatal("sdrplay_api_Update(Dev_Fs) Error: ", err);
+         }
+      }
+   }
+
+   return _dev->sample_rate;
 }
 
 double sdrplay_source_c::get_sample_rate()
 {
-   if (_running)
-   {
-      return _dev->fsHz;
-   }
-
-//   return 0;
-   return _dev->fsHz;
+   return _dev->sample_rate;
 }
 
 osmosdr::freq_range_t sdrplay_source_c::get_freq_range( size_t chan )
 {
-   osmosdr::freq_range_t range;
-
-   range += osmosdr::range_t( SDRPLAY_AM_MIN,  SDRPLAY_AM_MAX ); /* LW/MW/SW (150 kHz - 30 MHz) */
-   range += osmosdr::range_t( SDRPLAY_FM_MIN,  SDRPLAY_FM_MAX ); /* VHF Band II (64 - 108 MHz) */
-   range += osmosdr::range_t( SDRPLAY_B3_MIN,  SDRPLAY_B3_MAX ); /* Band III (162 - 240 MHz) */
-   range += osmosdr::range_t( SDRPLAY_B45_MIN, SDRPLAY_B45_MAX ); /* Band IV/V (470 - 960 MHz) */
-   range += osmosdr::range_t( SDRPLAY_L_MIN,   SDRPLAY_L_MAX ); /* L-Band (1450 - 1675 MHz) */
-
-   return range;
+   return osmosdr::freq_range_t( SDRPLAY_FREQ_MIN, SDRPLAY_FREQ_MAX );
 }
 
 double sdrplay_source_c::set_center_freq( double freq, size_t chan )
 {
-   std::cerr << "set_center_freq start" << std::endl;
-   std::cerr << "freq = " << freq << std::endl;
-   double diff = freq - _dev->rfHz;
-   std::cerr << "diff = " << diff << std::endl;
-   _dev->rfHz = freq;
-   set_gain_limits(freq);
-   if (_running) 
+   if (freq == _dev->rfHz)
    {
-      if (fabs(diff) < 10000.0)
-      {
-         std::cerr << "mir_sdr_SetRf started" << std::endl;
-         mir_sdr_SetRf(diff, 0, 0);
-      }
-      else
-      {
-         std::cerr << "reinit_device started" << std::endl;
-         reinit_device();
+      return get_center_freq( chan );
+   }
+   _dev->rfHz = freq;
+   set_rf_gain_values();
+   if (_started)
+   {
+      _dev->rx_channel_params->tunerParams.rfFreq.rfHz = _dev->rfHz;
+      sdrplay_api_ErrT err;
+      err = sdrplay_api_Update(_dev->device.dev, _dev->device.tuner,
+                               sdrplay_api_Update_Tuner_Frf,
+                               sdrplay_api_Update_Ext1_None);
+      if (err != sdrplay_api_Success) {
+         fatal("sdrplay_api_Update(Tuner_Frf) Error: ", err);
       }
    }
 
-   std::cerr << "set_center_freq end" << std::endl;
    return get_center_freq( chan );
 }
 
 double sdrplay_source_c::get_center_freq( size_t chan )
 {
-   if (_running)
-   {
-      return _dev->rfHz;
-   }
-
-//   return 0;
    return _dev->rfHz;
 }
 
 double sdrplay_source_c::set_freq_corr( double ppm, size_t chan )
 {
+   if (ppm == _dev->ppm || !(_dev->device_params->devParams))
+   {
+      return get_freq_corr( chan );
+   }
+   _dev->ppm = ppm;
+   if (_started)
+   {
+      _dev->device_params->devParams->ppm = _dev->ppm;
+      sdrplay_api_ErrT err;
+      err = sdrplay_api_Update(_dev->device.dev, _dev->device.tuner,
+                               sdrplay_api_Update_Dev_Ppm,
+                               sdrplay_api_Update_Ext1_None);
+      if (err != sdrplay_api_Success) {
+         fatal("sdrplay_api_Update(Dev_Ppm) Error: ", err);
+      }
+   }
    return get_freq_corr( chan );
 }
 
 double sdrplay_source_c::get_freq_corr( size_t chan )
 {
-   return 0;
+   return _dev->ppm;
 }
 
 std::vector<std::string> sdrplay_source_c::get_gain_names( size_t chan )
 {
    std::vector< std::string > gains;
 
-   gains += "LNA_MIX_BB";
+   gains += "IF";
+   gains += "RF";
 
    return gains;
 }
 
+osmosdr::gain_range_t sdrplay_source_c::get_if_gain_range( size_t chan )
+{
+   return osmosdr::gain_range_t( -_dev->max_if_gRdB, -_dev->min_if_gRdB, 1 );
+}
+
+osmosdr::gain_range_t sdrplay_source_c::get_rf_gain_range( size_t chan )
+{
+   const auto result = std::minmax_element( _dev->rfGRs.begin(), _dev->rfGRs.end() );
+   return osmosdr::gain_range_t( -*(result.second), -*(result.first), 1 );
+}
+
 osmosdr::gain_range_t sdrplay_source_c::get_gain_range( size_t chan )
 {
-   osmosdr::gain_range_t range;
-
-   for (int i = _dev->minGain; i < _dev->maxGain; i++)
-   {
-      range += osmosdr::range_t( (float)i );
-   }
-
-   return range;
+   std::cerr << "[WARNING] get_gain_range() is deprecated - please use get_gain_range(name) instead" << std::endl;
+   return osmosdr::gain_range_t();
 }
 
 osmosdr::gain_range_t sdrplay_source_c::get_gain_range( const std::string & name, size_t chan )
 {
-   return get_gain_range( chan );
+   if (name == "IF")
+   {
+      return get_if_gain_range( chan );
+   }
+   else if (name == "RF")
+   {
+      return get_rf_gain_range( chan );
+   }
+   return osmosdr::gain_range_t();
 }
 
 bool sdrplay_source_c::set_gain_mode( bool automatic, size_t chan )
 {
-   std::cerr << "set_gain_mode started" << std::endl;
-   _auto_gain = automatic;
-   std::cerr << "automatic = " << automatic << std::endl;
-   if (automatic)
+   if (automatic == _auto_gain)
    {
-      /* Start AGC */
-      std::cerr << "AGC not yet implemented" << std::endl;
+      return get_gain_mode(chan);
+   }
+   _auto_gain = automatic;
+   if (_started)
+   {
+      sdrplay_api_AgcT *agc = &_dev->rx_channel_params->ctrlParams.agc;
+      if (_auto_gain)
+      {
+         agc->enable = sdrplay_api_AGC_CTRL_EN;
+         agc->setPoint_dBfs = -30;
+         agc->attack_ms = 0;
+         agc->decay_ms = 0;
+         agc->decay_delay_ms = 0;
+         agc->decay_threshold_dB = 0;
+         agc->syncUpdate = 0;
+      } else {
+         agc->enable = sdrplay_api_AGC_DISABLE;
+         _dev->rx_channel_params->tunerParams.gain.gRdB = _dev->if_gRdB;
+      }
+      sdrplay_api_ErrT err;
+      err = sdrplay_api_Update(_dev->device.dev, _dev->device.tuner,
+                               sdrplay_api_Update_Ctrl_Agc,
+                               sdrplay_api_Update_Ext1_None);
+      if (err != sdrplay_api_Success) {
+         fatal("sdrplay_api_Update(Ctrl_Agc) Error: ", err);
+      }
    }
 
-   std::cerr << "set_gain_mode end" << std::endl;
    return get_gain_mode(chan);
 }
 
@@ -450,96 +1003,434 @@ bool sdrplay_source_c::get_gain_mode( size_t chan )
    return _auto_gain;
 }
 
+double sdrplay_source_c::set_if_gain( double gain, size_t chan )
+{
+   int if_gRdB = (int)(-gain);
+   if_gRdB = std::max(_dev->min_if_gRdB, std::min(_dev->max_if_gRdB, if_gRdB));
+   if (if_gRdB == _dev->if_gRdB)
+   {
+      return get_if_gain( chan );
+   }
+   _dev->if_gRdB = if_gRdB;
+   if (_started)
+   {
+      _dev->rx_channel_params->tunerParams.gain.gRdB = _dev->if_gRdB;
+      sdrplay_api_ErrT err;
+      err = sdrplay_api_Update(_dev->device.dev, _dev->device.tuner,
+                               sdrplay_api_Update_Tuner_Gr,
+                               sdrplay_api_Update_Ext1_None);
+      if (err != sdrplay_api_Success) {
+         fatal("sdrplay_api_Update(Tuner_Gr) Error: ", err);
+      }
+   }
+   return get_if_gain( chan );
+}
+
+double sdrplay_source_c::set_rf_gain( double gain, size_t chan )
+{
+   double gR = -gain;
+   // since the sequence of gR values is not necessarily monotonic, we
+   // can't use bisection here, but we have to go value by value
+   std::vector<int> diffs( _dev->rfGRs.size() );
+   for (int i = 0; i < (int)( _dev->rfGRs.size() ); ++i) {
+      diffs[i] = abs( gR - _dev->rfGRs[i] );
+   }
+   int current_rf_gR_index = _dev->rf_gR_index;
+   _dev->rf_gR_index = std::distance( diffs.begin(),
+                       std::min_element( diffs.begin(), diffs.end() ) );
+   if (_dev->rf_gR_index == current_rf_gR_index)
+   {
+      return -_dev->rfGRs[_dev->rf_gR_index];
+   }
+   if (_started)
+   {
+      _dev->rx_channel_params->tunerParams.gain.LNAstate = _dev->rf_gR_index;
+      sdrplay_api_ErrT err;
+      err = sdrplay_api_Update(_dev->device.dev, _dev->device.tuner,
+                               sdrplay_api_Update_Tuner_Gr,
+                               sdrplay_api_Update_Ext1_None);
+      if (err != sdrplay_api_Success) {
+         fatal("sdrplay_api_Update(Tuner_Gr) Error: ", err);
+      }
+   }
+   return -_dev->rfGRs[_dev->rf_gR_index];
+}
+
 double sdrplay_source_c::set_gain( double gain, size_t chan )
 {
-   std::cerr << "set_gain started" << std::endl;
-   _dev->gain_dB = gain;
-   std::cerr << "gain = " << gain << std::endl;
-   if (gain < _dev->minGain)
-   {
-      _dev->gain_dB = _dev->minGain;
-   }
-   if (gain > _dev->maxGain)
-   {
-      _dev->gain_dB = _dev->maxGain;
-   }
-   _dev->gRdB = (int)(_dev->maxGain - gain);
-
-   if (_running) 
-   {
-      std::cerr << "mir_sdr_SetGr started" << std::endl;
-      mir_sdr_SetGr(_dev->gRdB, 1, 0);
-   }
-
-std::cerr << "set_gain end" << std::endl;
-return get_gain( chan );
+   std::cerr << "[WARNING] set_gain() is deprecated - please use set_gain(name) instead" << std::endl;
+   return NAN;
 }
 
 double sdrplay_source_c::set_gain( double gain, const std::string & name, size_t chan)
 {
-   return set_gain( gain, chan );
+   if (name == "IF")
+   {
+      return set_if_gain( gain, chan );
+   }
+   else if (name == "RF")
+   {
+      return set_rf_gain( gain, chan );
+   }
+   return 0.0;
+}
+
+double sdrplay_source_c::get_if_gain( size_t chan )
+{
+   return (double)(-_dev->if_gRdB);
+}
+
+double sdrplay_source_c::get_rf_gain( size_t chan )
+{
+   return -_dev->rfGRs[_dev->rf_gR_index];
 }
 
 double sdrplay_source_c::get_gain( size_t chan )
 {
-   if ( _running )
-   {
-      return _dev->gain_dB;
-   }
-
-//   return 0;
-   return _dev->gain_dB;
+   std::cerr << "[WARNING] get_gain() is deprecated - please use get_gain(name) instead" << std::endl;
+   return NAN;
 }
 
 double sdrplay_source_c::get_gain( const std::string & name, size_t chan )
 {
-   return get_gain( chan );
+   if (name == "IF")
+   {
+      return get_if_gain( chan );
+   }
+   else if (name == "RF")
+   {
+      return get_rf_gain( chan );
+   }
+   return 0.0;
 }
 
 std::vector< std::string > sdrplay_source_c::get_antennas( size_t chan )
 {
    std::vector< std::string > antennas;
 
-   antennas += get_antenna( chan );
+   if (_dev->hwVer == SDRPLAY_RSP1_ID || _dev->hwVer == SDRPLAY_RSP1A_ID)
+   {
+      antennas.push_back( "RX" );
+   }
+   else if (_dev->hwVer == SDRPLAY_RSP2_ID)
+   {
+      antennas.push_back( "Antenna A" );
+      antennas.push_back( "Antenna B" );
+      antennas.push_back( "Hi-Z" );
+   }
+   else if (_dev->hwVer == SDRPLAY_RSPduo_ID)
+   {
+      switch (_dev->rspDuoMode)
+      {
+      case sdrplay_api_RspDuoMode_Single_Tuner:
+      case sdrplay_api_RspDuoMode_Master:
+         antennas.push_back( "Tuner 1 50 ohm" );
+         antennas.push_back( "Tuner 1 Hi-Z" );
+         antennas.push_back( "Tuner 2 50 ohm" );
+         break;
+      case sdrplay_api_RspDuoMode_Dual_Tuner:
+         antennas.push_back( "Tuner 1+2 50 ohm" );
+         break;
+      case sdrplay_api_RspDuoMode_Slave:
+         if (_dev->tuner == sdrplay_api_Tuner_A)
+         {
+            antennas.push_back( "Tuner 1 50 ohm" );
+            antennas.push_back( "Tuner 1 Hi-Z" );
+         }
+         else if (_dev->tuner == sdrplay_api_Tuner_B)
+         {
+            antennas.push_back( "Tuner 2 50 ohm" );
+         }
+         break;
+      case sdrplay_api_RspDuoMode_Unknown:
+         break;
+      }
+   }
+   else if (_dev->hwVer == SDRPLAY_RSPdx_ID)
+   {
+      antennas.push_back( "Antenna A" );
+      antennas.push_back( "Antenna B" );
+      antennas.push_back( "Antenna C" );
+   }
 
    return antennas;
 }
 
 std::string sdrplay_source_c::set_antenna( const std::string & antenna, size_t chan )
 {
+   if (_dev->hwVer == SDRPLAY_RSPduo_ID)
+   {
+      return set_rspduo_antenna(antenna, chan);
+   }
+
+   if (_dev->hwVer == SDRPLAY_RSP1_ID || _dev->hwVer == SDRPLAY_RSP1A_ID)
+   {
+      if (!(antenna == "RX"))
+      {
+         std::cerr << "[WARNING] invalid antenna " << antenna << std::endl;
+         return get_antenna( chan );
+      }
+      _dev->antenna = "RX";
+   }
+   else if (_dev->hwVer == SDRPLAY_RSP2_ID)
+   {
+      if (!(antenna == "Antenna A" || antenna == "Antenna B" || antenna == "Hi-Z"))
+      {
+         std::cerr << "[WARNING] invalid antenna " << antenna << std::endl;
+         return get_antenna( chan );
+      }
+   }
+   else if (_dev->hwVer == SDRPLAY_RSPdx_ID)
+   {
+      if (!(antenna == "Antenna A" || antenna == "Antenna B" || antenna == "Antenna C"))
+      {
+         std::cerr << "[WARNING] invalid antenna " << antenna << std::endl;
+         return get_antenna( chan );
+      }
+   }
+
+   if (antenna == _dev->antenna)
+   {
+      return get_antenna( chan );
+   }
+
+   _dev->antenna = antenna;
+
+   if (_started)
+   {
+      if (_dev->hwVer == SDRPLAY_RSP2_ID)
+      {
+         sdrplay_api_Rsp2TunerParamsT *rsp2TunerParams = &_dev->rx_channel_params->rsp2TunerParams;
+         // switch the AM port first
+         sdrplay_api_Rsp2_AmPortSelectT current_amPortSel = rsp2TunerParams->amPortSel;
+         rsp2TunerParams->amPortSel = _dev->antenna == "Hi-Z" ?
+                                          sdrplay_api_Rsp2_AMPORT_1 :
+                                          sdrplay_api_Rsp2_AMPORT_2;
+         if (rsp2TunerParams->amPortSel != current_amPortSel)
+         {
+            sdrplay_api_ErrT err;
+            err = sdrplay_api_Update(_dev->device.dev, _dev->device.tuner,
+                                     sdrplay_api_Update_Rsp2_AmPortSelect,
+                                     sdrplay_api_Update_Ext1_None);
+            if (err != sdrplay_api_Success) {
+               fatal("sdrplay_api_Update(Rsp2_AmPortSelect) Error: ", err);
+            }
+         }
+         // switch antenna control
+         sdrplay_api_Rsp2_AntennaSelectT current_antennaSel = rsp2TunerParams->antennaSel;
+         rsp2TunerParams->antennaSel = _dev->antenna == "Antenna B" ?
+                                          sdrplay_api_Rsp2_ANTENNA_B :
+                                          sdrplay_api_Rsp2_ANTENNA_A;
+         if (rsp2TunerParams->antennaSel != current_antennaSel)
+         {
+            sdrplay_api_ErrT err;
+            err = sdrplay_api_Update(_dev->device.dev, _dev->device.tuner,
+                                     sdrplay_api_Update_Rsp2_AntennaControl,
+                                     sdrplay_api_Update_Ext1_None);
+            if (err != sdrplay_api_Success) {
+               fatal("sdrplay_api_Update(Rsp2_AntennaControl) Error: ", err);
+            }
+         }
+      }
+      else if (_dev->hwVer == SDRPLAY_RSPdx_ID)
+      {
+         sdrplay_api_RspDxParamsT *rspDxParams = &_dev->device_params->devParams->rspDxParams;
+         // switch antenna control
+         sdrplay_api_RspDx_AntennaSelectT current_antennaSel = rspDxParams->antennaSel;
+         if (antenna == "Antenna A") {
+            rspDxParams->antennaSel = sdrplay_api_RspDx_ANTENNA_A;
+         } else if (antenna == "Antenna B") {
+            rspDxParams->antennaSel = sdrplay_api_RspDx_ANTENNA_B;
+         } else if (antenna == "Antenna C") {
+            rspDxParams->antennaSel = sdrplay_api_RspDx_ANTENNA_C;
+         }
+         if (rspDxParams->antennaSel != current_antennaSel)
+         {
+            sdrplay_api_ErrT err;
+            err = sdrplay_api_Update(_dev->device.dev, _dev->device.tuner,
+                                     sdrplay_api_Update_None,
+                                     sdrplay_api_Update_RspDx_AntennaControl);
+            if (err != sdrplay_api_Success) {
+               fatal("sdrplay_api_Update(RspDx_AntennaControl) Error: ", err);
+            }
+         }
+      }
+   }
+
+   return get_antenna( chan );
+}
+
+std::string sdrplay_source_c::set_rspduo_antenna( const std::string & antenna, size_t chan )
+{
+   switch (_dev->rspDuoMode)
+   {
+   case sdrplay_api_RspDuoMode_Single_Tuner:
+   case sdrplay_api_RspDuoMode_Master:
+      if (!(antenna == "Tuner 1 50 ohm" || antenna == "Tuner 1 Hi-Z" || antenna == "Tuner 2 50 ohm"))
+      {
+         std::cerr << "[WARNING] invalid antenna " << antenna << std::endl;
+         return get_antenna( chan );
+      }
+      break;
+   case sdrplay_api_RspDuoMode_Dual_Tuner:
+      if (!(antenna == "Tuner 1+2 50 ohm"))
+      {
+         std::cerr << "[WARNING] invalid antenna " << antenna << std::endl;
+         return get_antenna( chan );
+      }
+      break;
+   case sdrplay_api_RspDuoMode_Slave:
+      if (_dev->tuner == sdrplay_api_Tuner_A)
+      {
+         if (!(antenna == "Tuner 1 50 ohm" || antenna == "Tuner 1 Hi-Z"))
+         {
+            std::cerr << "[WARNING] invalid antenna " << antenna << std::endl;
+            return get_antenna( chan );
+         }
+      }
+      else if (_dev->tuner == sdrplay_api_Tuner_B)
+      {
+         if (!(antenna == "Tuner 2 50 ohm"))
+         {
+            std::cerr << "[WARNING] invalid antenna " << antenna << std::endl;
+            return get_antenna( chan );
+         }
+      }
+      break;
+   case sdrplay_api_RspDuoMode_Unknown:
+      break;
+   }
+
+   sdrplay_api_TunerSelectT tuner = _dev->tuner;
+   if (antenna.rfind("Tuner 1+2 ", 0) == 0)
+   {
+      tuner = sdrplay_api_Tuner_Both;
+   }
+   else if (antenna.rfind("Tuner 1 ", 0) == 0)
+   {
+      tuner = sdrplay_api_Tuner_A;
+   }
+   else if (antenna.rfind("Tuner 2 ", 0) == 0)
+   {
+      tuner = sdrplay_api_Tuner_B;
+   }
+
+   if (antenna == _dev->antenna && tuner ==_dev->tuner)
+   {
+      return get_antenna( chan );
+   }
+
+   _dev->antenna = antenna;
+   if (!_started) {
+       _dev->tuner = tuner;
+   }
+
+   if (_started)
+   {
+      sdrplay_api_RspDuo_AmPortSelectT tuner1AmPortSel;
+      if (_dev->antenna == "Tuner 1 Hi-Z") {
+         tuner1AmPortSel = sdrplay_api_RspDuo_AMPORT_1;
+      } else {
+         tuner1AmPortSel = sdrplay_api_RspDuo_AMPORT_2;
+      }
+      sdrplay_api_RspDuoTunerParamsT *rspDuoTunerParams = &_dev->rx_channel_params->rspDuoTunerParams;
+
+      // switch tuner if requested
+      sdrplay_api_ErrT err;
+      if (tuner != _dev->tuner)
+      {
+         switch (_dev->rspDuoMode)
+         {
+         case sdrplay_api_RspDuoMode_Single_Tuner:
+            err = sdrplay_api_SwapRspDuoActiveTuner(_dev->device.dev,
+                                                    &_dev->device.tuner,
+                                                    tuner1AmPortSel);
+            if (err != sdrplay_api_Success) {
+               fatal("sdrplay_api_SwapRspDuoActiveTuner() Error: ", err);
+            }
+            _dev->rx_channel_params = _dev->device_params->rxChannelA;
+            if (_dev->tuner == sdrplay_api_Tuner_B)
+               _dev->rx_channel_params = _dev->device_params->rxChannelB;
+            rspDuoTunerParams = &_dev->rx_channel_params->rspDuoTunerParams;
+            break;
+         case sdrplay_api_RspDuoMode_Dual_Tuner:
+            // we should never be here
+            break;
+         case sdrplay_api_RspDuoMode_Master:
+            // can't change tuner if a slave is attached
+            if (_dev->rspDuoModeChangeType != sdrplay_api_SlaveDllDisappeared)
+            {
+               std::cerr << "[WARNING] cannot change tuner in master mode while a slave is attached" << std::endl;
+               tuner1AmPortSel = rspDuoTunerParams->tuner1AmPortSel;
+            }
+            else
+            {
+               // stop, change tuner, and restart
+               stop();
+               _dev->tuner = tuner;
+               start();
+            }
+            break;
+         case sdrplay_api_RspDuoMode_Slave:
+            // we should never be here
+            break;
+         case sdrplay_api_RspDuoMode_Unknown:
+            break;
+         }
+      }
+
+      // switch the AM port
+      if (tuner1AmPortSel != rspDuoTunerParams->tuner1AmPortSel)
+      {
+         rspDuoTunerParams->tuner1AmPortSel = tuner1AmPortSel;
+         err = sdrplay_api_Update(_dev->device.dev, _dev->device.tuner,
+                                  sdrplay_api_Update_RspDuo_AmPortSelect,
+                                  sdrplay_api_Update_Ext1_None);
+         if (err != sdrplay_api_Success) {
+            fatal("sdrplay_api_Update(RspDuo_AmPortSelect) Error: ", err);
+         }
+      }
+   }
+
    return get_antenna( chan );
 }
 
 std::string sdrplay_source_c::get_antenna( size_t chan )
 {
-   return "RX";
+   return _dev->antenna;
 }
 
 void sdrplay_source_c::set_dc_offset_mode( int mode, size_t chan )
 {
-   if ( osmosdr::source::DCOffsetOff == mode ) 
+   int current_dcMode = _dev->dcMode;
+   if ( osmosdr::source::DCOffsetOff == mode )
    {
       _dev->dcMode = 0;
-      if (_running)
-      {
-         mir_sdr_SetDcMode(4, 1);
-      }
    }
-   else if ( osmosdr::source::DCOffsetManual == mode ) 
+   else if ( osmosdr::source::DCOffsetManual == mode )
    {
       std::cerr << "Manual DC correction mode is not implemented." << std::endl;
       _dev->dcMode = 0;
-      if (_running)
-      {
-         mir_sdr_SetDcMode(4, 1);
-      }
    }
    else if ( osmosdr::source::DCOffsetAutomatic == mode )
    {
       _dev->dcMode = 1;
-      if (_running)
-      {
-         mir_sdr_SetDcMode(4, 1);
+   }
+
+   if (_dev->dcMode == current_dcMode)
+   {
+      return;
+   }
+
+   if (_started)
+   {
+      _dev->rx_channel_params->ctrlParams.dcOffset.DCenable = _dev->dcMode;
+      sdrplay_api_ErrT err;
+      err = sdrplay_api_Update(_dev->device.dev, _dev->device.tuner,
+                               sdrplay_api_Update_Ctrl_DCoffsetIQimbalance,
+                               sdrplay_api_Update_Ext1_None);
+      if (err != sdrplay_api_Success) {
+         fatal("sdrplay_api_Update(Ctrl_DCoffsetIQimbalance) Error: ", err);
       }
    }
 }
@@ -551,50 +1442,286 @@ void sdrplay_source_c::set_dc_offset( const std::complex<double> &offset, size_t
 
 double sdrplay_source_c::set_bandwidth( double bandwidth, size_t chan )
 {
-   if      (bandwidth <= 200e3)  _dev->bwType = mir_sdr_BW_0_200;
-   else if (bandwidth <= 300e3)  _dev->bwType = mir_sdr_BW_0_300;
-   else if (bandwidth <= 600e3)  _dev->bwType = mir_sdr_BW_0_600;
-   else if (bandwidth <= 1536e3) _dev->bwType = mir_sdr_BW_1_536;
-   else if (bandwidth <= 5000e3) _dev->bwType = mir_sdr_BW_5_000;
-   else if (bandwidth <= 6000e3) _dev->bwType = mir_sdr_BW_6_000;
-   else if (bandwidth <= 7000e3) _dev->bwType = mir_sdr_BW_7_000;
-   else                          _dev->bwType = mir_sdr_BW_8_000;
-
-   if (_running) 
+   if (bandwidth > _dev->sample_rate)
    {
-      reinit_device();
+      std::cerr << "[WARNING] invalid bandwidth " << bandwidth << "Hz" << std::endl;
+      return get_bandwidth( chan );
    }
+   if (bandwidth == 0)
+   {
+      bandwidth = _dev->sample_rate;
+   }
+
+   sdrplay_api_Bw_MHzT current_bwType = _dev->bwType;
+
+   // add 1kHz to the bandwidth to give it a little margin
+   double bwplus1 = bandwidth + 1e3;
+   if      (bwplus1 <  300e3) { _dev->bwType = sdrplay_api_BW_0_200; }
+   else if (bwplus1 <  600e3) { _dev->bwType = sdrplay_api_BW_0_300; }
+   else if (bwplus1 < 1536e3) { _dev->bwType = sdrplay_api_BW_0_600; }
+   else if (bwplus1 < 5000e3) { _dev->bwType = sdrplay_api_BW_1_536; }
+   else if (bwplus1 < 6000e3) { _dev->bwType = sdrplay_api_BW_5_000; }
+   else if (bwplus1 < 7000e3) { _dev->bwType = sdrplay_api_BW_6_000; }
+   else if (bwplus1 < 8000e3) { _dev->bwType = sdrplay_api_BW_7_000; }
+   else                       { _dev->bwType = sdrplay_api_BW_8_000; }
+
+   if (_dev->bwType == current_bwType)
+   {
+      return get_bandwidth( chan );
+   }
+
+   if (_started)
+   {
+      _dev->rx_channel_params->tunerParams.bwType = _dev->bwType;
+      sdrplay_api_ErrT err;
+      err = sdrplay_api_Update(_dev->device.dev, _dev->device.tuner,
+                               sdrplay_api_Update_Tuner_BwType,
+                               sdrplay_api_Update_Ext1_None);
+      if (err != sdrplay_api_Success) {
+         fatal("sdrplay_api_Update(Tuner_BwType) Error: ", err);
+      }
+  }
 
    return get_bandwidth( chan );
 }
 
 double sdrplay_source_c::get_bandwidth( size_t chan )
 {
-   double tmpbw=0.0f;
-   if      (_dev->bwType == mir_sdr_BW_0_200) tmpbw =  200e3;
-   else if (_dev->bwType == mir_sdr_BW_0_300) tmpbw =  300e3;
-   else if (_dev->bwType == mir_sdr_BW_0_600) tmpbw =  600e3;
-   else if (_dev->bwType == mir_sdr_BW_1_536) tmpbw = 1536e3;
-   else if (_dev->bwType == mir_sdr_BW_5_000) tmpbw = 5000e3;
-   else if (_dev->bwType == mir_sdr_BW_6_000) tmpbw = 6000e3;
-   else if (_dev->bwType == mir_sdr_BW_7_000) tmpbw = 7000e3;
-   else                                       tmpbw = 8000e3;
-   
-   return (double)tmpbw;
+   return static_cast<double>( _dev->bwType );
 }
 
 osmosdr::freq_range_t sdrplay_source_c::get_bandwidth_range( size_t chan )
 {
    osmosdr::freq_range_t range;
 
-   range += osmosdr::range_t( 200e3 ); 
-   range += osmosdr::range_t( 300e3 ); 
-   range += osmosdr::range_t( 600e3 ); 
-   range += osmosdr::range_t( 1536e3 ); 
-   range += osmosdr::range_t( 5000e3 ); 
-   range += osmosdr::range_t( 6000e3 ); 
-   range += osmosdr::range_t( 7000e3 ); 
-   range += osmosdr::range_t( 8000e3 ); 
+   range += osmosdr::range_t( 200e3 );
+   range += osmosdr::range_t( 300e3 );
+   range += osmosdr::range_t( 600e3 );
+   range += osmosdr::range_t( 1536e3 );
+   range += osmosdr::range_t( 5000e3 );
+   range += osmosdr::range_t( 6000e3 );
+   range += osmosdr::range_t( 7000e3 );
+   range += osmosdr::range_t( 8000e3 );
 
    return range;
+}
+
+/****************************************************************************
+ * streaming functions
+ ****************************************************************************/
+void stream_A_callback(short *xi, short *xq,
+                       sdrplay_api_StreamCbParamsT *params,
+                       unsigned int numSamples,
+                       unsigned int reset,
+                       void *cbContext)
+{
+   sdrplay_source_c *self = static_cast<sdrplay_source_c *>(cbContext);
+#ifdef ONLY_CHECK_SAMPLE_GAPS
+   self->_sample_gaps_check(numSamples, params->firstSampleNum);
+   return;
+#endif
+   self->_buf_transfer(xi, xq, numSamples, params->firstSampleNum, 0);
+}
+
+void stream_B_callback(short *xi, short *xq,
+                       sdrplay_api_StreamCbParamsT *params,
+                       unsigned int numSamples,
+                       unsigned int reset,
+                       void *cbContext)
+{
+#ifdef ONLY_CHECK_SAMPLE_GAPS
+   return;
+#endif
+   sdrplay_source_c *self = static_cast<sdrplay_source_c *>(cbContext);
+   self->_buf_transfer(xi, xq, numSamples, params->firstSampleNum, 1);
+}
+
+void event_callback(sdrplay_api_EventT eventId,
+                    sdrplay_api_TunerSelectT tuner,
+                    sdrplay_api_EventParamsT *params,
+                    void *cbContext)
+{
+   sdrplay_source_c *self = static_cast<sdrplay_source_c *>(cbContext);
+   switch (eventId)
+   {
+   case sdrplay_api_GainChange:
+#ifdef SHOW_GAIN_CHANGES
+      {
+         sdrplay_api_GainCbParamT *gainParams = &params->gainParams;
+         std::cerr << "[INFO] gain change - gRdB=" << gainParams->gRdB << " lnaGRdB=" << gainParams->lnaGRdB << " currGain=" << gainParams->currGain << std::endl;
+      }
+#endif
+      break;
+   case sdrplay_api_PowerOverloadChange:
+      // send ack back for overload events
+      switch (params->powerOverloadParams.powerOverloadChangeType)
+      {
+      case sdrplay_api_Overload_Detected:
+         std::cerr << "[WARNING] Overload detected - please reduce gain" << std::endl;
+         break;
+      case sdrplay_api_Overload_Corrected:
+         if (self->_is_running())
+            std::cerr << "[WARNING] Overload corrected" << std::endl;
+         break;
+      }
+      self->_ack_overload_msg();
+      break;
+   case sdrplay_api_DeviceRemoved:
+      std::cerr << "[ERROR] device removed" << std::endl;
+      break;
+   case sdrplay_api_RspDuoModeChange:
+      {
+         sdrplay_api_RspDuoModeCbEventIdT modeChangeType = params->rspDuoModeParams.modeChangeType;
+         //std::cerr << "[INFO] RSPduo mode change - modeChangeType=" << modeChangeType << std::endl;
+         // save last RSPduo mode change
+         self->_save_rspduo_mode_change(modeChangeType);
+      }
+      break;
+   }
+}
+
+/****************************************************************************
+ * utility functions
+ ****************************************************************************/
+// a couple of utility functions to handle fatal errors
+// just throw an exception (for now)
+static void fatal(const char *message, sdrplay_api_ErrT err)
+{
+   std::string full_message = std::string(message) + sdrplay_api_GetErrorString(err);
+   std::cerr << "[FATAL] " << full_message << std::endl;
+   throw std::runtime_error(full_message);
+}
+
+static void fatal(const char *format, ...)
+{
+   va_list argList;
+   va_start(argList, format);
+   char *full_message = NULL;
+   if (vasprintf(&full_message, format, argList) != -1)
+   {
+      std::cerr << "[FATAL] " << full_message << std::endl;
+      throw std::runtime_error(full_message);
+      free(full_message);
+   }
+   va_end(argList);
+}
+
+std::string hwName(unsigned char hwVer)
+{
+   if (hwVer == SDRPLAY_RSP1_ID)
+      return "RSP1";
+   if (hwVer == SDRPLAY_RSP2_ID)
+      return "RSP2";
+   if (hwVer == SDRPLAY_RSP1A_ID)
+      return "RSP1A";
+   if (hwVer == SDRPLAY_RSPduo_ID)
+      return "RSPduo";
+   if (hwVer == SDRPLAY_RSPdx_ID)
+      return "RSPdx";
+   return "UNK";
+}
+
+static std::string rspDuoModeName(sdrplay_api_RspDuoModeT rspDuoMode)
+{
+  if (rspDuoMode == sdrplay_api_RspDuoMode_Single_Tuner)
+    return "Single Tuner";
+  if (rspDuoMode == sdrplay_api_RspDuoMode_Dual_Tuner)
+    return "Dual Tuner";
+  if (rspDuoMode == sdrplay_api_RspDuoMode_Master)
+    return "Master";
+  if (rspDuoMode == sdrplay_api_RspDuoMode_Slave)
+    return "Slave";
+  return "Unknown";
+}
+
+void sdrplay_source_c::_buf_transfer(short *xi, short *xq,
+                                     unsigned int numSamples,
+                                     unsigned int firstSampleNum, size_t chan)
+{
+   // only one channel is implemented (for now)
+   if (!_running || chan > 0)
+   {
+      return;
+   }
+#ifdef SAMPLE_NUM_GAP_WARNING
+   _sample_gaps_check(numSamples, firstSampleNum);
+#endif
+   {
+      std::lock_guard<std::mutex> lock(_buf_mutex);
+      _bufi = xi;
+      _bufq = xq;
+      _buf_length = numSamples;
+   }
+   _buf_ready.notify_one();
+   {
+      std::unique_lock<std::mutex> lock(_buf_mutex);
+      if (!_buf_ready.wait_for(lock, std::chrono::milliseconds(250),
+          [this]{return _buf_length == 0;}))
+      {
+         if (_running)
+            std::cerr << "[WARNING] _buf_ready.wait() timeout in _buf_transfer()" << std::endl;
+      }
+   }
+}
+
+void sdrplay_source_c::_sample_gaps_check(unsigned int numSamples,
+                                          unsigned int firstSampleNum)
+{
+   if (_next_sample_num != 0 && _next_sample_num != firstSampleNum) {
+      unsigned int sample_num_gap;
+      if (_next_sample_num < firstSampleNum) {
+         sample_num_gap = firstSampleNum - _next_sample_num;
+      } else {
+         sample_num_gap = UINT_MAX - (firstSampleNum - _next_sample_num) + 1;
+      }
+      std::cerr << "[WARNING] sample num gap: " << sample_num_gap << " [" <<
+                   _next_sample_num << ":" << firstSampleNum << "] -> " <<
+                   sample_num_gap / numSamples << "+" <<
+                   sample_num_gap % numSamples << std::endl;
+   }
+   _next_sample_num = firstSampleNum + numSamples;
+}
+
+void sdrplay_source_c::_ack_overload_msg()
+{
+   sdrplay_api_Update(_dev->device.dev, _dev->device.tuner,
+                      sdrplay_api_Update_Ctrl_OverloadMsgAck,
+                      sdrplay_api_Update_Ext1_None);
+}
+
+void sdrplay_source_c::_save_rspduo_mode_change(const int modeChangeType)
+{
+   _dev->rspDuoModeChangeType = static_cast<sdrplay_api_RspDuoModeCbEventIdT>(modeChangeType);
+}
+
+
+// Singleton class for SDRplay API (only one per process)
+sdrplay_api::sdrplay_api()
+{
+   sdrplay_api_ErrT err = sdrplay_api_Open();
+   if (err != sdrplay_api_Success) {
+      std::cerr << "---> Please check the sdrplay_api service to make sure it is up. If it is up, please restart it. <---" << std::endl;
+      fatal("sdrplay_api_Open() Error: ", err);
+   }
+
+   // Check API versions match
+   float ver;
+   err = sdrplay_api_ApiVersion(&ver);
+   if (err != sdrplay_api_Success) {
+      sdrplay_api_Close();
+      fatal("sdrplay_api_ApiVersion() Error: ", err);
+   }
+   if (ver != SDRPLAY_API_VERSION) {
+      sdrplay_api_Close();
+      fatal("sdrplay_api version: '%.3f' does not equal build version: '%.3f'",
+            ver, SDRPLAY_API_VERSION);
+   }
+}
+
+sdrplay_api::~sdrplay_api()
+{
+   sdrplay_api_ErrT err = sdrplay_api_Close();
+   if (err != sdrplay_api_Success) {
+      fatal("sdrplay_api_Close() Error: ", err);
+   }
 }

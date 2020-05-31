@@ -1,3 +1,48 @@
+# gr-osmosdr module for SDRplay API 3.x - supports RSPduo (all modes) and RSPdx
+
+* Please note that this code is still experimental - if you have problems running it, please create a new issue in github *
+
+This is a fork of the gr-osmosdr GnuRadio OOT module specifically for SDRplay RSPs.
+Main points:
+- requires SDRplay API version 3.x (3.07 as of June 2020)
+- requires GnuRadio >=3.8
+- supports RSPduo in all modes (one channel only for now)
+- supports RSPdx
+- supports the legacy devices (RSP1, RSP1A, and RSP2)
+- works with gqrx
+- tested only on Linux (Fedora 32 to be exact, but it should work on most recent Linux distributions)
+
+## How to build it:
+
+- download the SDRplay API version 3.x from here: https://www.sdrplay.com/downloads/ (select Linux x86 -> API/HW driver V3.x)
+- the file you downloaded should be called something like SDRplay_RSP_API-Linux-3.x.y.run; make it executable and run it (chmod u+x <filename>; sudo ./<filename>)
+- start the sdrplay_api service (or make sure the previous step started it)
+- make sure you have gcc, g++, and cmake installed to build the gr-osmosdr module
+- make sure you have GnuRadio (>= 3.8) and the matching GnuRadio developement package (on Fedora it is called 'gnuradio-devel'; on Debian/Ubuntu I think it is called 'gunradio-dev') installed
+- git clone this repo and cd to the repo directory
+- finally build and install this gr-osmosdr module with these commands:
+```
+mkdir build
+cd build
+cmake -Wno-dev -DENABLE_NONFREE=TRUE -DENABLE_SOAPY=OFF -DCMAKE_BUILD_TYPE=Release ../
+make
+sudo make install
+```
+- if you do not have gqrx already installed, you can get it or build it from here (https://github.com/csete/gqrx)
+
+
+#### cmake options
+
+This gr-osmosdr driver has a few cmake flags mostly for debugging and troublshhoting:
+- -DSAMPLE_NUM_GAP_WARNING=TRUE -> display a warning whenever there is a gap in the sample numbers in the stream callback function
+- -DONLY_CHECK_SAMPLE_GAPS=TRUE -> do not send samples back to the client app; just check for gaps in sample numbers
+- -DSHOW_GAIN_CHANGES=TRUE -> logs an INFO level message whenever a gain change event occurs (very noisy when AGC is enabled)
+
+
+
+===============================================================================
+Original README:
+
 While primarily being developed for the OsmoSDR hardware, this block
 as well supports:
 

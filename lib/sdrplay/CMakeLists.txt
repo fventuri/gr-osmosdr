@@ -34,3 +34,18 @@ list(APPEND gr_osmosdr_srcs
     ${CMAKE_CURRENT_SOURCE_DIR}/sdrplay_source_c.cc
 )
 set(gr_osmosdr_srcs ${gr_osmosdr_srcs} PARENT_SCOPE)
+
+# Configurable feature set
+set(SAMPLE_NUM_GAP_WARNING OFF CACHE BOOL "Display a warning whenever there is a gap in the sample numbers in the stream callback function")
+set(ONLY_CHECK_SAMPLE_GAPS OFF CACHE BOOL "Do not send samples back to the client app; just check for gaps in sample numbers")
+set(SHOW_GAIN_CHANGES OFF CACHE BOOL "logs an INFO level message whenever a gain change event occurs (very noisy when AGC is enabled)")
+
+if(SAMPLE_NUM_GAP_WARNING)
+    target_compile_definitions(gnuradio-osmosdr PRIVATE -DSAMPLE_NUM_GAP_WARNING=1)
+endif()
+if(ONLY_CHECK_SAMPLE_GAPS)
+    target_compile_definitions(gnuradio-osmosdr PRIVATE -DONLY_CHECK_SAMPLE_GAPS=1)
+endif()
+if(SHOW_GAIN_CHANGES)
+    target_compile_definitions(gnuradio-osmosdr PRIVATE -DSHOW_GAIN_CHANGES=1)
+endif()

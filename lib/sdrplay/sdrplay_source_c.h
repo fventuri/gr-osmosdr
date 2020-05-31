@@ -23,9 +23,8 @@
 
 #include <gnuradio/sync_block.h>
 
-#include <gnuradio/thread/thread.h>
-#include <boost/thread/mutex.hpp>
-#include <boost/thread/condition_variable.hpp>
+#include <mutex>
+#include <condition_variable>
 
 #include "osmosdr/ranges.h"
 
@@ -78,6 +77,9 @@ private:
 public:
    ~sdrplay_source_c ();	// public destructor
 
+   bool start();
+   bool stop();
+
    int work( int noutput_items,
             gr_vector_const_void_star &input_items,
             gr_vector_void_star &output_items );
@@ -97,12 +99,18 @@ public:
    double get_freq_corr( size_t chan = 0 );
 
    std::vector<std::string> get_gain_names( size_t chan = 0 );
+   osmosdr::gain_range_t get_if_gain_range( size_t chan = 0 );
+   osmosdr::gain_range_t get_rf_gain_range( size_t chan = 0 );
    osmosdr::gain_range_t get_gain_range( size_t chan = 0 );
    osmosdr::gain_range_t get_gain_range( const std::string & name, size_t chan = 0 );
    bool set_gain_mode( bool automatic, size_t chan = 0 );
    bool get_gain_mode( size_t chan = 0 );
+   double set_if_gain( double gain, size_t chan = 0 );
+   double set_rf_gain( double gain, size_t chan = 0 );
    double set_gain( double gain, size_t chan = 0 );
    double set_gain( double gain, const std::string & name, size_t chan = 0 );
+   double get_if_gain( size_t chan = 0 );
+   double get_rf_gain( size_t chan = 0 );
    double get_gain( size_t chan = 0 );
    double get_gain( const std::string & name, size_t chan = 0 );
 
@@ -116,21 +124,35 @@ public:
    double set_bandwidth( double bandwidth, size_t chan = 0 );
    double get_bandwidth( size_t chan = 0 );
    osmosdr::freq_range_t get_bandwidth_range( size_t chan = 0 );
+   void _buf_transfer(short *xi, short *xq, unsigned int numSamples,
+                      unsigned int firstSampleNum, size_t chan = 0);
+   void _sample_gaps_check(unsigned int numSamples,
+                           unsigned int firstSampleNum);
+   void _ack_overload_msg();
+   void _save_rspduo_mode_change(const int modeChangeType);
+   bool _is_running() { return _running; }
 
 private:
-   void reinit_device(void);
-   void set_gain_limits(double freq);
+   bool select_device();
+   bool select_rspduo_device();
+   void set_device_antenna();
+   std::string set_rspduo_antenna(const std::string & antenna, size_t chan = 0);
+   void set_rf_gain_values();
 
    sdrplay_dev_t *_dev;
 
-   std::vector< short > _bufi;
-   std::vector< short > _bufq;
-   int _buf_offset;
-   boost::mutex _buf_mutex;
+   short *_bufi;
+   short *_bufq;
+   int _buf_length;
+   std::mutex _buf_mutex;
+   std::condition_variable _buf_ready;
 
+   bool _selected;
+   bool _started;
    bool _running;
-   bool _uninit;
    bool _auto_gain;
+
+   unsigned int _next_sample_num;
 };
 
 #endif /* INCLUDED_SDRPLAY_SOURCE_C_H */
