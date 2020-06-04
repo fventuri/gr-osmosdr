@@ -43,7 +43,7 @@ typedef ptrdiff_t ssize_t;
 
 #define BLADERF_DEBUG_ENABLE
 
-typedef boost::shared_ptr<struct bladerf> bladerf_sptr;
+typedef std::shared_ptr<struct bladerf> bladerf_sptr;
 
 /* Identification of the bladeRF hardware in use */
 typedef enum {
