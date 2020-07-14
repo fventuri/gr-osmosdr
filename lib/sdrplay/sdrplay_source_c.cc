@@ -1487,7 +1487,7 @@ double sdrplay_source_c::set_bandwidth( double bandwidth, size_t chan )
 
 double sdrplay_source_c::get_bandwidth( size_t chan )
 {
-   return static_cast<double>( _dev->bwType );
+   return static_cast<double>( _dev->bwType ) * 1e3;
 }
 
 osmosdr::freq_range_t sdrplay_source_c::get_bandwidth_range( size_t chan )
