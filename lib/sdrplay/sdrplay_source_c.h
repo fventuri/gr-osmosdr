@@ -107,10 +107,14 @@ public:
    bool get_gain_mode( size_t chan = 0 );
    double set_if_gain( double gain, size_t chan = 0 );
    double set_rf_gain( double gain, size_t chan = 0 );
+   bool set_rf_notch( double gain, size_t chan = 0 );
+   bool set_dab_notch( double gain, size_t chan = 0 );
    double set_gain( double gain, size_t chan = 0 );
    double set_gain( double gain, const std::string & name, size_t chan = 0 );
    double get_if_gain( size_t chan = 0 );
    double get_rf_gain( size_t chan = 0 );
+   bool get_rf_notch( size_t chan = 0 );
+   bool get_dab_notch( size_t chan = 0 );
    double get_gain( size_t chan = 0 );
    double get_gain( const std::string & name, size_t chan = 0 );
 

@@ -69,10 +69,13 @@ struct sdrplay_dev
    int max_if_gRdB;
    std::vector<int> rfGRs;
    int rf_gR_index;
+   unsigned char rf_notch;
+   unsigned char dab_notch;
 
    // other parameters
    int dcMode;
    double ppm;
+   int biasT;
 
    // hardware specific parameters
    std::string sdrplay;
@@ -188,7 +191,11 @@ sdrplay_source_c::sdrplay_source_c (const std::string &args)
    _dev->if_gRdB = 50;
    _dev->min_if_gRdB = sdrplay_api_NORMAL_MIN_GR;
    _dev->max_if_gRdB = MAX_BB_GR;
+   _dev->rf_notch = 0;
+   _dev->dab_notch = 0;
    _dev->dcMode = 0;
+   _dev->ppm = 0;
+   _dev->biasT = 0;
    dict_t dict = params_to_dict(args);
    _dev->sdrplay = dict.count("sdrplay") ? dict["sdrplay"] : "0";
    _dev->hwVer = dict.count("hwVer") ?
@@ -230,6 +237,10 @@ sdrplay_source_c::sdrplay_source_c (const std::string &args)
                         _dev->hwVer == SDRPLAY_RSPduo_ID ||
                         _dev->hwVer == SDRPLAY_RSP1A_ID ||
                         _dev->hwVer == SDRPLAY_RSPdx_ID) ? 4 : 1;
+   if (dict.count("bias"))
+   {
+      _dev->biasT = std::stoi(dict["bias"]);
+   }
 
    _buf_mutex.lock();
    _bufi = 0;
@@ -543,6 +554,15 @@ bool sdrplay_source_c::start()
    tunerParams->dcOffsetTuner.trackTime = 63;
    if (_dev->device_params->devParams) {
       _dev->device_params->devParams->ppm = _dev->ppm;
+   }
+   if (_dev->hwVer == SDRPLAY_RSP1A_ID) {
+      _dev->rx_channel_params->rsp1aTunerParams.biasTEnable = _dev->biasT;
+   } else if (_dev->hwVer == SDRPLAY_RSP2_ID) {
+      _dev->rx_channel_params->rsp2TunerParams.biasTEnable = _dev->biasT;
+   } else if (_dev->hwVer == SDRPLAY_RSPduo_ID) {
+      _dev->rx_channel_params->rspDuoTunerParams.biasTEnable = _dev->biasT;
+   } else if (_dev->hwVer == SDRPLAY_RSPdx_ID) {
+      _dev->device_params->devParams->rspDxParams.biasTEnable = _dev->biasT;
    }
 
    // prepare callback functions for streaming
@@ -1056,6 +1076,115 @@ double sdrplay_source_c::set_rf_gain( double gain, size_t chan )
    return -_dev->rfGRs[_dev->rf_gR_index];
 }
 
+bool sdrplay_source_c::set_rf_notch( double gain, size_t chan )
+{
+   _dev->rf_notch = gain == 0 ? 0 : 1;
+   if (_started)
+   {
+      if (_dev->hwVer == SDRPLAY_RSP1A_ID)
+      {
+         _dev->device_params->devParams->rsp1aParams.rfNotchEnable = _dev->rf_notch;
+         sdrplay_api_ErrT err;
+         err = sdrplay_api_Update(_dev->device.dev, _dev->device.tuner,
+                                  sdrplay_api_Update_Rsp1a_RfNotchControl,
+                                  sdrplay_api_Update_Ext1_None);
+         if (err != sdrplay_api_Success) {
+            fatal("sdrplay_api_Update(Rsp1a_RfNotchControl) Error: ", err);
+         }
+      }
+      else if (_dev->hwVer == SDRPLAY_RSP2_ID)
+      {
+         _dev->rx_channel_params->rsp2TunerParams.rfNotchEnable = _dev->rf_notch;
+         sdrplay_api_ErrT err;
+         err = sdrplay_api_Update(_dev->device.dev, _dev->device.tuner,
+                                  sdrplay_api_Update_Rsp2_RfNotchControl,
+                                  sdrplay_api_Update_Ext1_None);
+         if (err != sdrplay_api_Success) {
+            fatal("sdrplay_api_Update(Rsp2_RfNotchControl) Error: ", err);
+         }
+      }
+      else if (_dev->hwVer == SDRPLAY_RSPduo_ID)
+      {
+         if (_dev->device.tuner == sdrplay_api_Tuner_A && _dev->rx_channel_params->rspDuoTunerParams.tuner1AmPortSel == sdrplay_api_RspDuo_AMPORT_1)
+         {
+            _dev->rx_channel_params->rspDuoTunerParams.tuner1AmNotchEnable = _dev->rf_notch;
+            sdrplay_api_ErrT err;
+            err = sdrplay_api_Update(_dev->device.dev, _dev->device.tuner,
+                                     sdrplay_api_Update_RspDuo_Tuner1AmNotchControl,
+                                     sdrplay_api_Update_Ext1_None);
+            if (err != sdrplay_api_Success) {
+               fatal("sdrplay_api_Update(RspDuo_Tuner1AmNotchControl) Error: ", err);
+            }
+         }
+         else if (_dev->rx_channel_params->rspDuoTunerParams.tuner1AmPortSel == sdrplay_api_RspDuo_AMPORT_2)
+         {
+            _dev->rx_channel_params->rspDuoTunerParams.rfNotchEnable = _dev->rf_notch;
+            sdrplay_api_ErrT err;
+            err = sdrplay_api_Update(_dev->device.dev, _dev->device.tuner,
+                                     sdrplay_api_Update_RspDuo_RfNotchControl,
+                                     sdrplay_api_Update_Ext1_None);
+            if (err != sdrplay_api_Success) {
+               fatal("sdrplay_api_Update(RspDuo_RfNotchControl) Error: ", err);
+            }
+         }
+      }
+      else if (_dev->hwVer == SDRPLAY_RSPdx_ID)
+      {
+         _dev->device_params->devParams->rspDxParams.rfNotchEnable = _dev->rf_notch;
+         sdrplay_api_ErrT err;
+         err = sdrplay_api_Update(_dev->device.dev, _dev->device.tuner,
+                                  sdrplay_api_Update_None,
+                                  sdrplay_api_Update_RspDx_RfNotchControl);
+         if (err != sdrplay_api_Success) {
+            fatal("sdrplay_api_Update(RspDx_RfNotchControl) Error: ", err);
+         }
+      }
+   }
+   return get_rf_notch( chan );
+}
+
+bool sdrplay_source_c::set_dab_notch( double gain, size_t chan )
+{
+   _dev->dab_notch = gain == 0 ? 0 : 1;
+   if (_started)
+   {
+      if (_dev->hwVer == SDRPLAY_RSP1A_ID)
+      {
+         _dev->device_params->devParams->rsp1aParams.rfDabNotchEnable = _dev->dab_notch;
+         sdrplay_api_ErrT err;
+         err = sdrplay_api_Update(_dev->device.dev, _dev->device.tuner,
+                                  sdrplay_api_Update_Rsp1a_RfDabNotchControl,
+                                  sdrplay_api_Update_Ext1_None);
+         if (err != sdrplay_api_Success) {
+            fatal("sdrplay_api_Update(Rsp1a_RfDabNotchControl) Error: ", err);
+         }
+      }
+      else if (_dev->hwVer == SDRPLAY_RSPduo_ID)
+      {
+         _dev->rx_channel_params->rspDuoTunerParams.rfDabNotchEnable = _dev->dab_notch;
+         sdrplay_api_ErrT err;
+         err = sdrplay_api_Update(_dev->device.dev, _dev->device.tuner,
+                                  sdrplay_api_Update_RspDuo_RfDabNotchControl,
+                                  sdrplay_api_Update_Ext1_None);
+         if (err != sdrplay_api_Success) {
+            fatal("sdrplay_api_Update(RspDuo_RfDabNotchControl) Error: ", err);
+         }
+      }
+      else if (_dev->hwVer == SDRPLAY_RSPdx_ID)
+      {
+         _dev->device_params->devParams->rspDxParams.rfDabNotchEnable = _dev->dab_notch;
+         sdrplay_api_ErrT err;
+         err = sdrplay_api_Update(_dev->device.dev, _dev->device.tuner,
+                                  sdrplay_api_Update_None,
+                                  sdrplay_api_Update_RspDx_RfDabNotchControl);
+         if (err != sdrplay_api_Success) {
+            fatal("sdrplay_api_Update(RspDx_RfDabNotchControl) Error: ", err);
+         }
+      }
+   }
+   return get_dab_notch( chan );
+}
+
 double sdrplay_source_c::set_gain( double gain, size_t chan )
 {
    std::cerr << "[WARNING] set_gain() is deprecated - please use set_gain(name) instead" << std::endl;
@@ -1072,6 +1201,14 @@ double sdrplay_source_c::set_gain( double gain, const std::string & name, size_t
    {
       return set_rf_gain( gain, chan );
    }
+   else if (name == "BCAST_NOTCH" || name == "RF_NOTCH")
+   {
+      return set_rf_notch( gain, chan );
+   }
+   else if (name == "DAB_NOTCH")
+   {
+      return set_dab_notch( gain, chan );
+   }
    return 0.0;
 }
 
@@ -1083,6 +1220,16 @@ double sdrplay_source_c::get_if_gain( size_t chan )
 double sdrplay_source_c::get_rf_gain( size_t chan )
 {
    return -_dev->rfGRs[_dev->rf_gR_index];
+}
+
+bool sdrplay_source_c::get_rf_notch( size_t chan )
+{
+   return _dev->rf_notch != 0;
+}
+
+bool sdrplay_source_c::get_dab_notch( size_t chan )
+{
+   return _dev->dab_notch != 0;
 }
 
 double sdrplay_source_c::get_gain( size_t chan )
@@ -1100,6 +1247,14 @@ double sdrplay_source_c::get_gain( const std::string & name, size_t chan )
    else if (name == "RF")
    {
       return get_rf_gain( chan );
+   }
+   else if (name == "BCAST_NOTCH" || name == "RF_NOTCH")
+   {
+      return get_rf_notch( chan );
+   }
+   else if (name == "DAB_NOTCH")
+   {
+      return get_dab_notch( chan );
    }
    return 0.0;
 }
