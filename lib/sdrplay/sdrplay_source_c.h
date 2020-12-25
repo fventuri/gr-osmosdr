@@ -101,6 +101,8 @@ public:
    std::vector<std::string> get_gain_names( size_t chan = 0 );
    osmosdr::gain_range_t get_if_gain_range( size_t chan = 0 );
    osmosdr::gain_range_t get_rf_gain_range( size_t chan = 0 );
+   osmosdr::gain_range_t get_rf_notch_range( size_t chan = 0 );
+   osmosdr::gain_range_t get_dab_notch_range( size_t chan = 0 );
    osmosdr::gain_range_t get_gain_range( size_t chan = 0 );
    osmosdr::gain_range_t get_gain_range( const std::string & name, size_t chan = 0 );
    bool set_gain_mode( bool automatic, size_t chan = 0 );

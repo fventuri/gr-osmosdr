@@ -949,6 +949,16 @@ std::vector<std::string> sdrplay_source_c::get_gain_names( size_t chan )
 
    gains += "IF";
    gains += "RF";
+   if (_dev->hwVer == SDRPLAY_RSP1A_ID || _dev->hwVer == SDRPLAY_RSP2_ID ||
+       _dev->hwVer == SDRPLAY_RSPduo_ID || _dev->hwVer == SDRPLAY_RSPdx_ID)
+   {
+      gains += "RF_NOTCH";
+   }
+   if (_dev->hwVer == SDRPLAY_RSP1A_ID || _dev->hwVer == SDRPLAY_RSPduo_ID ||
+       _dev->hwVer == SDRPLAY_RSPdx_ID)
+   {
+      gains += "DAB_NOTCH";
+   }
 
    return gains;
 }
@@ -962,6 +972,16 @@ osmosdr::gain_range_t sdrplay_source_c::get_rf_gain_range( size_t chan )
 {
    const auto result = std::minmax_element( _dev->rfGRs.begin(), _dev->rfGRs.end() );
    return osmosdr::gain_range_t( -*(result.second), -*(result.first), 1 );
+}
+
+osmosdr::gain_range_t sdrplay_source_c::get_rf_notch_range( size_t chan )
+{
+   return osmosdr::gain_range_t( 0, 1, 1 );
+}
+
+osmosdr::gain_range_t sdrplay_source_c::get_dab_notch_range( size_t chan )
+{
+   return osmosdr::gain_range_t( 0, 1, 1 );
 }
 
 osmosdr::gain_range_t sdrplay_source_c::get_gain_range( size_t chan )
@@ -979,6 +999,14 @@ osmosdr::gain_range_t sdrplay_source_c::get_gain_range( const std::string & name
    else if (name == "RF")
    {
       return get_rf_gain_range( chan );
+   }
+   else if (name == "RF_NOTCH" || name == "BCAST_NOTCH")
+   {
+      return get_rf_notch_range( chan );
+   }
+   else if (name == "DAB_NOTCH")
+   {
+      return get_dab_notch_range( chan );
    }
    return osmosdr::gain_range_t();
 }
@@ -1201,7 +1229,7 @@ double sdrplay_source_c::set_gain( double gain, const std::string & name, size_t
    {
       return set_rf_gain( gain, chan );
    }
-   else if (name == "BCAST_NOTCH" || name == "RF_NOTCH")
+   else if (name == "RF_NOTCH" || name == "BCAST_NOTCH")
    {
       return set_rf_notch( gain, chan );
    }
